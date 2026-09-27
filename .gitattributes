@@ -1,0 +1,4 @@
+# zig fmt only accepts LF; a Windows checkout with core.autocrlf=true would
+# otherwise hand it CRLF and fail the format check.
+*.zig text eol=lf
+*.zon text eol=lf
