@@ -35,6 +35,14 @@ pub fn exited(child: *const std.process.Child) bool {
 }
 
 pub fn reapBounded(child: *std.process.Child, io: std.Io, grace_ms: u32) void {
+    // Waiting on the handle returns the moment the child exits; polling would
+    // add half an interval to every pick whose producer closes stdout first.
+    if (builtin.os.tag == .windows) {
+        if (WaitForSingleObject(child.id.?, grace_ms) == 0) {
+            _ = child.wait(io) catch {};
+        } else child.kill(io);
+        return;
+    }
     var elapsed: u32 = 0;
     while (elapsed < grace_ms) : (elapsed += 10) {
         if (exited(child)) {
