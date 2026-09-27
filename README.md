@@ -45,13 +45,24 @@ that pushes rows itself (`.callback`, e.g. a directory walker; stop when
 `sink.push` returns false). `filter` drops or rewrites lines, `max_rows` stops
 the source after that many kept rows, and `collect` runs a feed with no UI.
 
+## Preview
+
+`Options.preview` takes a `Previewer`: a function called on a worker thread
+with the current row, returning `PreviewText` (SGR colours pass through; an
+optional `focus_line` is scrolled into view and marked). A slow preview never
+blocks typing, and stale results are dropped. Two ready-made previewers:
+`commandPreviewer` runs a command with `{}` replaced by the row (e.g. `bat`),
+killed after a timeout; `textPreview` needs no tool - numbered lines from the
+head of a text file, "(binary file)", or a directory's entries.
+Shift-Up/Shift-Down scroll the pane.
+
 ## Trying it by hand
 
 The repo builds `glean.exe`, a test harness for the library. It is not meant
 to be installed; for a general command-line picker, use fzf.
 
 ```text
-glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [--max-rows N] [FILE | -- COMMAND...]
+glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [--max-rows N] [--preview CMD] [--preview-window up:N%[:wrap]] [--preview-text] [FILE | -- COMMAND...]
 ```
 
 Without FILE, glean reads stdin to EOF. The picker uses the Windows console,

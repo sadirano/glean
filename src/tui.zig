@@ -67,6 +67,8 @@ extern "kernel32" fn WriteConsoleW(handle: Handle, buffer: [*]const u16, length:
 pub const Key = union(enum) {
     up,
     down,
+    shift_up,
+    shift_down,
     ctrl_k,
     ctrl_j,
     ctrl_p,
@@ -264,8 +266,8 @@ pub const Console = struct {
             if (key) |k| return k;
         }
         switch (vk) {
-            0x26 => return .up,
-            0x28 => return .down,
+            0x26 => return if (event.dwControlKeyState & shift_pressed != 0) .shift_up else .up,
+            0x28 => return if (event.dwControlKeyState & shift_pressed != 0) .shift_down else .down,
             0x21 => return .page_up,
             0x22 => return .page_down,
             0x09 => return if (event.dwControlKeyState & shift_pressed != 0) .backtab else .tab,

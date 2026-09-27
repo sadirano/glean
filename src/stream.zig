@@ -317,6 +317,10 @@ pub fn pickFeed(arena: Allocator, io: std.Io, feed: Feed, opts: pick.Options) !F
     try session.start();
     var frame_arena = std.heap.ArenaAllocator.init(arena);
     defer frame_arena.deinit();
+    var preview_worker: ?pick.PreviewWorker = if (opts.preview) |callback| pick.PreviewWorker.init(callback) else null;
+    if (preview_worker) |*worker| try worker.start();
+    defer if (preview_worker) |*worker| worker.deinit();
+    var last_preview_id: ?usize = null;
     const theme = pick.Theme.fromEnvironment(opts.colors);
     var running = true;
     var displayed: usize = 0;
@@ -324,6 +328,9 @@ pub fn pickFeed(arena: Allocator, io: std.Io, feed: Feed, opts: pick.Options) !F
     var wakes: usize = 0;
     var draw = true;
     while (true) {
+        if (preview_worker) |*worker| {
+            if (try pick.syncPreview(&state, worker, &last_preview_id)) draw = true;
+        }
         if (draw) {
             _ = frame_arena.reset(.retain_capacity);
             state.producer_running = running;
@@ -333,8 +340,11 @@ pub fn pickFeed(arena: Allocator, io: std.Io, feed: Feed, opts: pick.Options) !F
             draw = false;
         }
         if (!running) {
-            if (try state.step(try console.readKey())) |outcome| return try selected(arena, &state, outcome);
-            draw = true;
+            const key = if (preview_worker != null) try console.pollKey(50) else try console.readKey();
+            if (key) |pressed| {
+                if (try state.step(pressed)) |outcome| return try selected(arena, &state, outcome);
+                draw = true;
+            }
             continue;
         }
         if (try console.pollKey(50)) |key| {
@@ -380,6 +390,41 @@ fn selected(arena: Allocator, state: *pick.State, outcome: pick.Outcome) !FeedOu
             break :blk .{ .picked = rows };
         },
     };
+}
+
+fn testPreview(_: *anyopaque, _: Allocator, _: []const u8) anyerror!pick.PreviewText {
+    return .{ .text = "" };
+}
+
+test "preview layout and focused line share the screen with the list" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var state = try pick.State.init(a, &.{"row"}, .{ .preview = .{ .ctx = &dummy, .func = testPreview } });
+    defer state.deinit();
+    state.setPreview(.{ .text = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11", .focus_line = 8 });
+    const frame = try pick.render(&state, .{}, 40, 20, false, false, a);
+    defer a.free(frame);
+    var lines = std.mem.splitSequence(u8, frame, "\r\n");
+    var index: usize = 0;
+    while (lines.next()) |line| : (index += 1) {
+        if (index == 2) try std.testing.expect(std.mem.startsWith(u8, line, "8"));
+        if (index == 8) {
+            try std.testing.expectEqual(@as(usize, 40), line.len);
+            for (line) |byte| try std.testing.expectEqual(@as(u8, '-'), byte);
+        }
+        if (index == 17) try std.testing.expect(std.mem.startsWith(u8, line, ">  row"));
+        if (index == 18) try std.testing.expect(std.mem.startsWith(u8, line, "1/1"));
+        if (index == 19) try std.testing.expect(std.mem.startsWith(u8, line, "> _"));
+    }
+    try std.testing.expectEqual(@as(usize, 20), index);
+    try std.testing.expectEqual(@as(usize, 5), state.preview_scroll);
+    _ = try state.step(.shift_down);
+    try std.testing.expectEqual(@as(usize, 6), state.preview_scroll);
+    _ = try state.step(.shift_up);
+    try std.testing.expectEqual(@as(usize, 5), state.preview_scroll);
+    const small = try pick.render(&state, .{}, 40, 7, false, false, a);
+    defer a.free(small);
+    try std.testing.expectEqual(@as(usize, 0), state.preview_height);
 }
 
 test "splitter handles CR, split reads, and a final line" {

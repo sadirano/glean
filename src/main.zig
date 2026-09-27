@@ -1,15 +1,35 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const stream = @import("stream.zig");
 const pick = @import("pick.zig");
 const fuzzy = @import("fuzzy.zig");
 
-const usage = "usage: glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--max-rows N] [--filter QUERY] [FILE | -- COMMAND...]\n";
+const usage = "usage: glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--max-rows N] [--filter QUERY] [--preview COMMAND | --preview-text] [--preview-window up:N%[:wrap]] [FILE | -- COMMAND...]\n";
 
 const FileRows = struct { rows: []const []const u8 };
 
 fn pushFileRows(ctx: *anyopaque, sink: *stream.Sink) anyerror!void {
     const source: *FileRows = @ptrCast(@alignCast(ctx));
     for (source.rows) |row| if (!sink.push(row)) break;
+}
+
+const TextContext = struct { io: std.Io };
+
+fn showText(ctx: *anyopaque, arena: std.mem.Allocator, row: []const u8) anyerror!pick.PreviewText {
+    const source: *TextContext = @ptrCast(@alignCast(ctx));
+    var path = row;
+    var focus: ?usize = null;
+    var at: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, row, at, ':')) |colon| {
+        at = colon + 1;
+        const end = std.mem.indexOfScalarPos(u8, row, at, ':') orelse break;
+        const number = std.fmt.parseInt(usize, row[at..end], 10) catch continue;
+        if (number == 0) continue;
+        path = row[0..colon];
+        focus = number;
+        break;
+    }
+    return pick.textPreview(arena, source.io, path, focus);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -30,6 +50,8 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
     var file: ?[]const u8 = null;
     var filter: ?[]const u8 = null;
     var command: ?[]const []const u8 = null;
+    var preview_line: ?[]const u8 = null;
+    var preview_text = false;
     var max_rows: usize = 0;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -47,12 +69,19 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
             opts.multi = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--preview-text")) {
+            preview_text = true;
+            preview_line = null;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--")) {
             if (!std.mem.eql(u8, arg, "--prompt") and
                 !std.mem.eql(u8, arg, "--header-lines") and
                 !std.mem.eql(u8, arg, "--delimiter") and
                 !std.mem.eql(u8, arg, "--with-nth") and
                 !std.mem.eql(u8, arg, "--max-rows") and
+                !std.mem.eql(u8, arg, "--preview") and
+                !std.mem.eql(u8, arg, "--preview-window") and
                 !std.mem.eql(u8, arg, "--filter"))
             {
                 try err.print("glean: unknown option {s}\n", .{arg});
@@ -68,6 +97,31 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
             const value = args[i];
             if (std.mem.eql(u8, arg, "--filter")) {
                 filter = value;
+            } else if (std.mem.eql(u8, arg, "--preview")) {
+                preview_line = value;
+                preview_text = false;
+            } else if (std.mem.eql(u8, arg, "--preview-window")) {
+                const prefix = "up:";
+                if (!std.mem.startsWith(u8, value, prefix)) {
+                    try err.print("glean: unsupported preview window {s}\n", .{value});
+                    try err.flush();
+                    return 2;
+                }
+                const spec = value[prefix.len..];
+                const percent_end = std.mem.indexOfScalar(u8, spec, '%') orelse {
+                    try err.print("glean: invalid preview window {s}\n", .{value});
+                    try err.flush();
+                    return 2;
+                };
+                const suffix = spec[percent_end + 1 ..];
+                const percent = std.fmt.parseInt(u8, spec[0..percent_end], 10) catch 101;
+                if (percent > 100 or (!std.mem.eql(u8, suffix, "") and !std.mem.eql(u8, suffix, ":wrap"))) {
+                    try err.print("glean: invalid preview window {s}\n", .{value});
+                    try err.flush();
+                    return 2;
+                }
+                opts.preview_percent = percent;
+                opts.preview_wrap = std.mem.eql(u8, suffix, ":wrap");
             } else if (std.mem.eql(u8, arg, "--max-rows")) {
                 max_rows = std.fmt.parseInt(usize, value, 10) catch {
                     try err.print("glean: invalid value for {s}: {s}\n", .{ arg, value });
@@ -121,6 +175,21 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
     }
 
     opts.colors = init.minimal.environ.getAlloc(arena, "FZF_DEFAULT_OPTS") catch null;
+    var text_context: TextContext = .{ .io = io };
+    var preview_argv: [4][]const u8 = undefined;
+    var command_preview: pick.CommandPreview = undefined;
+    if (preview_text) {
+        opts.preview = .{ .ctx = &text_context, .func = showText };
+    } else if (preview_line) |line| {
+        if (builtin.os.tag == .windows) {
+            preview_argv = .{ "cmd.exe", "/d", "/c", line };
+            command_preview = .{ .io = io, .argv = preview_argv[0..4], .shell_quote = true };
+        } else {
+            preview_argv = .{ "sh", "-c", line, "" };
+            command_preview = .{ .io = io, .argv = preview_argv[0..3], .shell_quote = true };
+        }
+        opts.preview = pick.commandPreviewer(&command_preview);
+    }
     var file_rows: FileRows = .{ .rows = &.{} };
     if (file) |path| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);

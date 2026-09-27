@@ -4,8 +4,16 @@
 const std = @import("std");
 const fuzzy = @import("fuzzy.zig");
 const tui = @import("tui.zig");
+const preview = @import("preview.zig");
 
 const Allocator = std.mem.Allocator;
+
+pub const PreviewText = preview.PreviewText;
+pub const Previewer = preview.Previewer;
+pub const CommandPreview = preview.Command;
+pub const PreviewWorker = preview.Worker;
+pub const commandPreviewer = preview.commandPreviewer;
+pub const textPreview = preview.textPreview;
 
 pub const default_colors =
     "--color=fg:#c0caf5,bg:-1,hl:#2ac3de,fg+:#c0caf5,bg+:#283457 " ++
@@ -22,6 +30,9 @@ pub const Options = struct {
     /// fzf `--color=` words applied over default_colors; callers normally
     /// pass the FZF_DEFAULT_OPTS environment value. Other words are ignored.
     colors: ?[]const u8 = null,
+    preview: ?Previewer = null,
+    preview_percent: u8 = 40,
+    preview_wrap: bool = false,
 };
 
 pub const Outcome = union(enum) { picked: []const u32, cancelled, no_console };
@@ -121,6 +132,9 @@ pub const State = struct {
     scroll: usize = 0,
     screen_height: usize = 24,
     preview_height: usize = 0,
+    preview_text: ?PreviewText = null,
+    preview_scroll: usize = 0,
+    preview_focus_pending: bool = false,
     producer_running: bool = false,
     spinner_frame: usize = 0,
 
@@ -214,11 +228,32 @@ pub const State = struct {
         // unrelated row; fzf goes back to the best match, and so do we.
         self.current = 0;
         self.scroll = 0;
+        self.preview_scroll = 0;
     }
 
     pub fn setHeight(self: *State, height: usize) void {
         self.screen_height = height;
+        const headers = @min(self.opts.header_lines, self.rows.len);
+        const content = if (self.opts.preview != null and height >= 8)
+            @min(height * @as(usize, @min(self.opts.preview_percent, 100)) / 100, height -| (3 +| headers))
+        else
+            0;
+        self.preview_height = if (content > 0) content + 1 else 0;
         self.keepInView();
+    }
+
+    pub const CurrentRow = struct { id: usize, text: []const u8 };
+
+    pub fn currentRow(self: *const State) ?CurrentRow {
+        if (self.current >= self.hits.len) return null;
+        const id = @as(usize, self.hits[self.current].index) + @min(self.opts.header_lines, self.rows.len);
+        return .{ .id = id, .text = self.rows[id] };
+    }
+
+    pub fn setPreview(self: *State, value: PreviewText) void {
+        self.preview_text = value;
+        self.preview_scroll = 0;
+        self.preview_focus_pending = true;
     }
 
     fn listHeight(self: *const State) usize {
@@ -235,12 +270,14 @@ pub const State = struct {
 
     fn move(self: *State, delta: isize) void {
         if (self.hits.len == 0) return;
+        const previous = self.current;
         if (delta < 0) {
             self.current -|= @intCast(-delta);
         } else {
             self.current = @min(self.hits.len - 1, self.current +| @as(usize, @intCast(delta)));
         }
         self.keepInView();
+        if (self.current != previous) self.preview_scroll = 0;
     }
 
     fn toggle(self: *State) void {
@@ -278,6 +315,14 @@ pub const State = struct {
             .down, .ctrl_j, .ctrl_n => self.move(-1),
             .page_up => self.move(@intCast(@min(self.listHeight(), std.math.maxInt(isize)))),
             .page_down => self.move(-@as(isize, @intCast(@min(self.listHeight(), std.math.maxInt(isize))))),
+            .shift_up => {
+                self.preview_scroll -|= 1;
+                self.preview_focus_pending = false;
+            },
+            .shift_down => {
+                self.preview_scroll +|= 1;
+                self.preview_focus_pending = false;
+            },
             .tab => {
                 self.toggle();
                 if (self.opts.multi) self.move(1);
@@ -547,13 +592,47 @@ pub fn render(state: *State, theme: Theme, width: usize, height: usize, colors: 
     const glyphs = if (unicode) unicode_glyphs else ascii_glyphs;
     var out: std.ArrayList(u8) = .empty;
     if (colors) try append(&out, arena, "\x1b[H");
-    const header_count = @min(@min(state.opts.header_lines, state.rows.len), height -| 2);
-    const list_height = height -| (2 + header_count + @min(state.preview_height, height -| 2));
-    const list_start = @min(state.preview_height, height -| 2);
+    const pane_height = state.preview_height -| 1;
+    const formatted = if (pane_height > 0 and state.preview_text != null)
+        try preview.format(arena, state.preview_text.?, width, state.opts.preview_wrap, colors)
+    else
+        null;
+    defer if (formatted) |content| {
+        for (content.lines) |line| arena.free(line.text);
+        arena.free(content.lines);
+    };
+    if (formatted) |content| {
+        if (state.preview_focus_pending) {
+            state.preview_scroll = if (content.focus_row) |row| row -| (pane_height / 3) else 0;
+            state.preview_focus_pending = false;
+        }
+        state.preview_scroll = @min(state.preview_scroll, content.lines.len -| 1);
+    }
+    const header_count = @min(@min(state.opts.header_lines, state.rows.len), height -| (2 +| state.preview_height));
+    const list_height = height -| (2 + header_count + state.preview_height);
+    const list_start = state.preview_height;
     const overflow = state.hits.len > list_height and list_height > 0;
     for (0..height) |line| {
         if (line != 0) try append(&out, arena, "\r\n");
-        if (line >= list_start and line < list_start + list_height) {
+        if (line < pane_height) {
+            if (formatted) |content| {
+                const position = state.preview_scroll + line;
+                if (position < content.lines.len) {
+                    const visual = content.lines[position];
+                    const focused = state.preview_text.?.focus_line != null and visual.source == state.preview_text.?.focus_line.?;
+                    try style(&out, arena, colors, if (focused) theme.hl else theme.fg, theme.bg);
+                    try append(&out, arena, visual.text);
+                    try pad(&out, arena, visual.width, width);
+                } else {
+                    try pad(&out, arena, 0, width);
+                }
+            } else {
+                try pad(&out, arena, 0, width);
+            }
+        } else if (state.preview_height > 0 and line == pane_height) {
+            try style(&out, arena, colors, theme.border, theme.bg);
+            for (0..width) |_| try append(&out, arena, glyphs.separator);
+        } else if (line >= list_start and line < list_start + list_height) {
             const from_bottom = list_start + list_height - 1 - line;
             const hit_pos = state.scroll + from_bottom;
             if (hit_pos < state.hits.len) {
@@ -599,6 +678,28 @@ pub fn render(state: *State, theme: Theme, width: usize, height: usize, colors: 
     return out.toOwnedSlice(arena);
 }
 
+pub fn syncPreview(state: *State, worker: *PreviewWorker, last_id: *?usize) !bool {
+    const current = state.currentRow();
+    const id: ?usize = if (current) |row| row.id else null;
+    var changed = false;
+    if (id != last_id.*) {
+        if (current) |row| {
+            try worker.post(row.id, row.text);
+        } else {
+            worker.clear();
+            state.preview_text = null;
+        }
+        state.preview_scroll = 0;
+        last_id.* = id;
+        changed = true;
+    }
+    if (worker.take(id)) |value| {
+        state.setPreview(value);
+        changed = true;
+    }
+    return changed;
+}
+
 pub fn pick(arena: Allocator, rows: []const []const u8, opts: Options) !Outcome {
     var console = tui.Console.open() catch return .no_console;
     defer console.close();
@@ -606,14 +707,19 @@ pub fn pick(arena: Allocator, rows: []const []const u8, opts: Options) !Outcome 
     defer state.deinit();
     var frame_arena = std.heap.ArenaAllocator.init(arena);
     defer frame_arena.deinit();
+    var worker: ?PreviewWorker = if (opts.preview) |callback| PreviewWorker.init(callback) else null;
+    if (worker) |*active| try active.start();
+    defer if (worker) |*active| active.deinit();
+    var last_id: ?usize = null;
     const theme = Theme.fromEnvironment(opts.colors);
     while (true) {
+        if (worker) |*active| _ = try syncPreview(&state, active, &last_id);
         _ = frame_arena.reset(.retain_capacity);
         const size = try console.size();
         const frame = try render(&state, theme, size.width, size.height, console.vt, console.vt, frame_arena.allocator());
         try console.write(frame);
-        const key = try console.readKey();
-        if (try state.step(key)) |result| return result;
+        const key = if (worker != null) try console.pollKey(50) else try console.readKey();
+        if (key) |pressed| if (try state.step(pressed)) |result| return result;
     }
 }
 
