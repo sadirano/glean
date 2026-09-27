@@ -344,6 +344,9 @@ pub const Command = struct {
     /// Legacy shell-source substitution, unsafe for untrusted rows or arbitrary
     /// quoting contexts. Prefer whole-argument substitution with this disabled.
     shell_quote: bool = false,
+    /// Where the command runs; rows relative to it reach it unchanged, as
+    /// fzf passes them. Null inherits the picker's own directory.
+    cwd: ?[]const u8 = null,
 };
 
 /// Each argv element equal to "{}" becomes the row. With shell_quote set,
@@ -429,7 +432,7 @@ fn commandRun(ctx: *anyopaque, arena: Allocator, row: []const u8) !PreviewText {
         else
             arg;
     }
-    var child = try std.process.spawn(command.io, .{ .argv = argv, .stdout = .pipe, .stderr = .ignore });
+    var child = try std.process.spawn(command.io, .{ .argv = argv, .cwd = if (command.cwd) |dir| .{ .path = dir } else .inherit, .stdout = .pipe, .stderr = .ignore });
     const output = child.stdout.?;
     // Keep the reader's handle alive while the watchdog reaps the child.
     child.stdout = null;
@@ -606,4 +609,14 @@ test "a command preview the cursor has left is killed, so the next row's preview
         }
     }
     return error.TestExpectedPreview;
+}
+
+test "a command preview runs in its cwd, so a relative row resolves there" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var command: Command = .{ .io = std.testing.io, .argv = &.{ "python", "-c", "import os;print(os.path.basename(os.getcwd()))" }, .cwd = "src" };
+    const previewer = commandPreviewer(&command);
+    const value = try previewer.func(previewer.ctx, arena_state.allocator(), "");
+    try std.testing.expect(std.mem.startsWith(u8, value.text, "src"));
 }
