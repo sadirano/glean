@@ -1,7 +1,8 @@
 const std = @import("std");
 const pick = @import("pick.zig");
+const fuzzy = @import("fuzzy.zig");
 
-const usage = "usage: glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [FILE]\n";
+const usage = "usage: glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [FILE]\n";
 
 pub fn main(init: std.process.Init) !void {
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -19,6 +20,7 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
     const err = &stderr_writer.interface;
     var opts: pick.Options = .{};
     var file: ?[]const u8 = null;
+    var filter: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -30,7 +32,8 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
             if (!std.mem.eql(u8, arg, "--prompt") and
                 !std.mem.eql(u8, arg, "--header-lines") and
                 !std.mem.eql(u8, arg, "--delimiter") and
-                !std.mem.eql(u8, arg, "--with-nth"))
+                !std.mem.eql(u8, arg, "--with-nth") and
+                !std.mem.eql(u8, arg, "--filter"))
             {
                 try err.print("glean: unknown option {s}\n", .{arg});
                 try err.flush();
@@ -43,7 +46,9 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
             }
             i += 1;
             const value = args[i];
-            if (std.mem.eql(u8, arg, "--prompt")) {
+            if (std.mem.eql(u8, arg, "--filter")) {
+                filter = value;
+            } else if (std.mem.eql(u8, arg, "--prompt")) {
                 opts.prompt = value;
             } else if (std.mem.eql(u8, arg, "--header-lines")) {
                 opts.header_lines = std.fmt.parseInt(usize, value, 10) catch {
@@ -106,6 +111,20 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
         }
     }
     if (rows.items.len == 0) return 1;
+
+    // fzf's --filter: rank without a UI, so the matcher can be compared
+    // against fzf on the same input, for speed and for ranking.
+    if (filter) |text| {
+        const query = try fuzzy.parseQuery(arena, text, .smart);
+        const visible = try arena.alloc([]const u8, rows.items.len);
+        for (rows.items, visible) |row, *part| part.* = fuzzy.visiblePart(row, opts.delimiter, opts.with_nth_from);
+        const hits = try fuzzy.rank(arena, query, visible);
+        var out_buffer: [64 * 1024]u8 = undefined;
+        var out_writer = std.Io.File.stdout().writer(io, &out_buffer);
+        for (hits) |hit| try out_writer.interface.print("{s}\n", .{rows.items[hit.index]});
+        try out_writer.interface.flush();
+        return if (hits.len == 0) 1 else 0;
+    }
 
     switch (try pick.pick(arena, rows.items, opts)) {
         .picked => |indices| {

@@ -42,7 +42,7 @@ The repo builds `glean.exe`, a test harness for the library. It is not meant
 to be installed; for a general command-line picker, use fzf.
 
 ```text
-glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [FILE]
+glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [FILE]
 ```
 
 Without FILE, glean reads stdin to EOF. The picker uses the Windows console,
