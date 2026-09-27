@@ -1,0 +1,6 @@
+[actions]
+build = "zig build"
+test = "zig build test"
+ci = "zig build ci"
+# Try the picker by hand: x glean :try -- <file> [--multi] [--header-lines N] ...
+try = "zig build try -- {args}"

@@ -1,0 +1,15 @@
+.{
+    .fingerprint = 0x4300b8997b38a9f,
+    .name = .glean,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "NOTICE",
+        "README.md",
+    },
+}

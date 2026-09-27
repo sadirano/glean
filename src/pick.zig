@@ -2,12 +2,16 @@
 //! Console handles and input records stay in tui.zig.
 
 const std = @import("std");
-const app_zig = @import("app.zig");
 const fuzzy = @import("fuzzy.zig");
 const tui = @import("tui.zig");
 
-const App = app_zig.App;
 const Allocator = std.mem.Allocator;
+
+pub const default_colors =
+    "--color=fg:#c0caf5,bg:-1,hl:#2ac3de,fg+:#c0caf5,bg+:#283457 " ++
+    "--color=hl+:#2ac3de,info:#7aa2f7,prompt:#2ac3de,pointer:#ff007c " ++
+    "--color=marker:#ff5da0,spinner:#ff007c,header:#ff9e64,query:#c0caf5 " ++
+    "--color=border:#27a1b9,separator:#ff9e64,gutter:#283457";
 
 pub const Options = struct {
     prompt: []const u8 = "> ",
@@ -15,6 +19,9 @@ pub const Options = struct {
     header_lines: usize = 0,
     delimiter: ?u8 = null,
     with_nth_from: usize = 1,
+    /// fzf `--color=` words applied over default_colors; callers normally
+    /// pass the FZF_DEFAULT_OPTS environment value. Other words are ignored.
+    colors: ?[]const u8 = null,
 };
 
 pub const Outcome = union(enum) { picked: []const u32, cancelled, no_console };
@@ -43,7 +50,7 @@ pub const Theme = struct {
 
     pub fn fromEnvironment(extra: ?[]const u8) Theme {
         var theme: Theme = .{};
-        theme.apply(app_zig.fzf_tokyonight_theme);
+        theme.apply(default_colors);
         if (extra) |words| theme.apply(words);
         return theme;
     }
@@ -520,15 +527,14 @@ pub fn render(state: *State, theme: Theme, width: usize, height: usize, colors: 
     return out.toOwnedSlice(arena);
 }
 
-pub fn pick(app: *App, rows: []const []const u8, opts: Options) !Outcome {
-    if (app.no_prompt) return .no_console;
+pub fn pick(arena: Allocator, rows: []const []const u8, opts: Options) !Outcome {
     var console = tui.Console.open() catch return .no_console;
     defer console.close();
-    var state = try State.init(app.arena, rows, opts);
+    var state = try State.init(arena, rows, opts);
     defer state.deinit();
-    var frame_arena = std.heap.ArenaAllocator.init(app.arena);
+    var frame_arena = std.heap.ArenaAllocator.init(arena);
     defer frame_arena.deinit();
-    const theme = Theme.fromEnvironment(app.env.get("FZF_DEFAULT_OPTS"));
+    const theme = Theme.fromEnvironment(opts.colors);
     while (true) {
         _ = frame_arena.reset(.retain_capacity);
         const size = try console.size();
@@ -536,57 +542,6 @@ pub fn pick(app: *App, rows: []const []const u8, opts: Options) !Outcome {
         try console.write(frame);
         const key = try console.readKey();
         if (try state.step(key)) |result| return result;
-    }
-}
-
-pub fn cmdPickTry(app: *App, args: []const []const u8) !u8 {
-    if (args.len == 0) {
-        try app.err.writeAll("usage: nix --pick-try <file> [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..]\n");
-        return 1;
-    }
-    var opts: Options = .{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--multi")) {
-            opts.multi = true;
-            continue;
-        }
-        if (i + 1 >= args.len) return error.MissingPickOptionValue;
-        i += 1;
-        const value = args[i];
-        if (std.mem.eql(u8, arg, "--prompt")) {
-            opts.prompt = value;
-        } else if (std.mem.eql(u8, arg, "--header-lines")) {
-            opts.header_lines = try std.fmt.parseInt(usize, value, 10);
-        } else if (std.mem.eql(u8, arg, "--delimiter")) {
-            if (std.mem.eql(u8, value, "\\t")) {
-                opts.delimiter = '\t';
-            } else if (value.len == 1) {
-                opts.delimiter = value[0];
-            } else return error.InvalidPickDelimiter;
-        } else if (std.mem.eql(u8, arg, "--with-nth")) {
-            if (value.len < 3 or !std.mem.endsWith(u8, value, "..")) return error.InvalidPickField;
-            opts.with_nth_from = try std.fmt.parseInt(usize, value[0 .. value.len - 2], 10);
-            if (opts.with_nth_from == 0) return error.InvalidPickField;
-        } else return error.UnknownPickOption;
-    }
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(app.io, args[0], app.arena, .unlimited);
-    var rows: std.ArrayList([]const u8) = .empty;
-    if (bytes.len > 0) {
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
-        while (lines.next()) |line| {
-            if (lines.index == null and line.len == 0 and bytes[bytes.len - 1] == '\n') break;
-            try rows.append(app.arena, std.mem.trimEnd(u8, line, "\r"));
-        }
-    }
-    switch (try pick(app, rows.items, opts)) {
-        .picked => |indices| {
-            for (indices) |index| try app.out.print("{s}\n", .{rows.items[index]});
-            return 0;
-        },
-        .cancelled => return 130,
-        .no_console => return 1,
     }
 }
 
