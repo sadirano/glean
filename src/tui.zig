@@ -62,6 +62,7 @@ extern "kernel32" fn SetConsoleCursorPosition(handle: Handle, position: Coord) c
 extern "kernel32" fn SetConsoleActiveScreenBuffer(handle: Handle) callconv(.winapi) i32;
 extern "kernel32" fn ReadConsoleInputW(handle: Handle, records: [*]InputRecord, length: u32, read: *u32) callconv(.winapi) i32;
 extern "kernel32" fn WaitForSingleObject(handle: Handle, milliseconds: u32) callconv(.winapi) u32;
+extern "kernel32" fn WaitForMultipleObjects(count: u32, handles: [*]const Handle, wait_all: i32, milliseconds: u32) callconv(.winapi) u32;
 extern "kernel32" fn WriteConsoleW(handle: Handle, buffer: [*]const u16, length: u32, written: *u32, reserved: ?*anyopaque) callconv(.winapi) i32;
 
 pub const Key = union(enum) {
@@ -221,14 +222,28 @@ pub const Console = struct {
     }
 
     pub fn pollKey(self: *Console, timeout_ms: u32) !?Key {
+        return self.pollKeyOrWake(null, timeout_ms);
+    }
+
+    /// pollKeyOrWake is pollKey that also returns, with no key, the moment
+    /// `wake` is signalled - how a finished preview reaches the screen
+    /// without waiting out the timeout.
+    pub fn pollKeyOrWake(self: *Console, wake: ?*anyopaque, timeout_ms: u32) !?Key {
         if (builtin.os.tag != .windows) return error.Unsupported;
         if (self.repeat_left > 0) {
             self.repeat_left -= 1;
             return self.repeated.?;
         }
-        const result = WaitForSingleObject(self.input, timeout_ms);
-        if (result == 258) return null;
-        if (result != 0) return error.ConsoleRead;
+        if (wake) |event| {
+            const handles = [_]Handle{ self.input, event };
+            const result = WaitForMultipleObjects(2, &handles, 0, timeout_ms);
+            if (result == 1 or result == 258) return null;
+            if (result != 0) return error.ConsoleRead;
+        } else {
+            const result = WaitForSingleObject(self.input, timeout_ms);
+            if (result == 258) return null;
+            if (result != 0) return error.ConsoleRead;
+        }
         var record: InputRecord = undefined;
         var count: u32 = 0;
         if (ReadConsoleInputW(self.input, @ptrCast(&record), 1, &count) == 0 or count == 0) return error.ConsoleRead;

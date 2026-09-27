@@ -6,6 +6,10 @@ const Allocator = std.mem.Allocator;
 const worker_allocator = std.heap.smp_allocator;
 const lifecycle = @import("lifecycle.zig");
 extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
+extern "kernel32" fn CreateEventW(attributes: ?*anyopaque, manual_reset: i32, initial_state: i32, name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn SetEvent(event: *anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn WaitForSingleObject(handle: *anyopaque, milliseconds: u32) callconv(.winapi) u32;
 
 fn sleepMs(milliseconds: u32) void {
     if (builtin.os.tag == .windows) {
@@ -80,12 +84,16 @@ pub const Worker = struct {
     generation: usize = 0,
     stopped: bool = false,
     thread: ?std.Thread = null,
+    /// Signalled on every publication (Windows), so the frame loop can wait
+    /// on input and previews at once instead of polling for either.
+    wake: ?*anyopaque = null,
 
     pub fn init(previewer: Previewer) Worker {
         return .{ .previewer = previewer };
     }
 
     pub fn start(self: *Worker) !void {
+        if (builtin.os.tag == .windows) self.wake = CreateEventW(null, 0, 0, null);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -128,6 +136,9 @@ pub const Worker = struct {
         self.stopped = true;
         self.mutex.unlock();
         if (self.thread) |thread| thread.join();
+        if (builtin.os.tag == .windows) if (self.wake) |event| {
+            _ = CloseHandle(event);
+        };
         if (self.request) |request| worker_allocator.free(request.row);
         if (self.published) |*result| result.deinit();
         if (self.displayed) |*result| result.deinit();
@@ -165,6 +176,9 @@ pub const Worker = struct {
             if (!self.stopped and self.generation == generation) {
                 if (self.published) |*old| old.deinit();
                 self.published = .{ .id = work.id, .arena = arena, .value = value };
+                if (builtin.os.tag == .windows) if (self.wake) |event| {
+                    _ = SetEvent(event);
+                };
             } else {
                 arena.deinit();
             }
@@ -619,4 +633,19 @@ test "a command preview runs in its cwd, so a relative row resolves there" {
     const previewer = commandPreviewer(&command);
     const value = try previewer.func(previewer.ctx, arena_state.allocator(), "");
     try std.testing.expect(std.mem.startsWith(u8, value.text, "src"));
+}
+
+fn quickPreview(_: *anyopaque, _: Allocator, _: []const u8) anyerror!PreviewText {
+    return .{ .text = "ready" };
+}
+
+test "a published preview signals the wake event the frame loop waits on" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var dummy: u8 = 0;
+    var worker = Worker.init(.{ .ctx = &dummy, .func = quickPreview });
+    try worker.start();
+    defer worker.deinit();
+    try worker.post(1, "row");
+    try std.testing.expectEqual(@as(u32, 0), WaitForSingleObject(worker.wake.?, 2000));
+    try std.testing.expect(worker.take(1) != null);
 }

@@ -369,14 +369,14 @@ pub fn pickFeed(arena: Allocator, io: std.Io, feed: Feed, opts: pick.Options) !F
             draw = false;
         }
         if (!running) {
-            const key = if (preview_worker != null) try console.pollKey(50) else try console.readKey();
+            const key = if (preview_worker) |*worker| try console.pollKeyOrWake(worker.wake, 50) else try console.readKey();
             if (key) |pressed| {
                 if (try state.step(pressed)) |outcome| return try selected(arena, &state, outcome);
                 draw = true;
             }
             continue;
         }
-        if (try console.pollKey(50)) |key| {
+        if (try console.pollKeyOrWake(if (preview_worker) |*worker| worker.wake else null, 50)) |key| {
             if (try state.step(key)) |outcome| return try selected(arena, &state, outcome);
             draw = true;
         }

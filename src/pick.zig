@@ -704,7 +704,7 @@ pub fn pick(arena: Allocator, rows: []const []const u8, opts: Options) !Outcome 
         const size = try console.size();
         const frame = try render(&state, theme, size.width, size.height, console.vt, console.vt, frame_arena.allocator());
         try console.write(frame);
-        const key = if (worker != null) try console.pollKey(50) else try console.readKey();
+        const key = if (worker) |*active| try console.pollKeyOrWake(active.wake, 50) else try console.readKey();
         if (key) |pressed| if (try state.step(pressed)) |result| return result;
     }
 }
