@@ -415,7 +415,7 @@ fn selected(arena: Allocator, state: *pick.State, outcome: pick.Outcome) !FeedOu
         .picked => |indices| blk: {
             defer arena.free(indices);
             const rows = try arena.alloc([]const u8, indices.len);
-            for (indices, rows) |index, *row| row.* = try arena.dupe(u8, state.rows[index]);
+            for (indices, rows) |index, *row| row.* = try arena.dupe(u8, state.rowText(index));
             break :blk .{ .picked = rows };
         },
     };

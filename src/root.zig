@@ -21,4 +21,5 @@ pub const collect = stream.collect;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("review_test.zig");
+    _ = @import("ansi.zig");
 }

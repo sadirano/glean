@@ -35,6 +35,8 @@ switch (result) {
 
 The returned indices refer to the original rows. Pass `Options.colors` to
 apply `--color=` words over the built-in palette.
+`Options.ansi`, like fzf's `--ansi`, draws the SGR colors a row carries while
+matching, previewing and returning it without them.
 
 ## Streaming rows
 
@@ -64,7 +66,7 @@ the harness through `~/.nix/bin`. It is not a replacement for fzf as a general
 command-line picker.
 
 ```text
-glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [--max-rows N] [--preview CMD] [--preview-window up:N%[:wrap]] [--preview-text] [FILE | -- COMMAND...]
+glean [--multi] [--ansi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [--max-rows N] [--preview CMD] [--preview-window up:N%[:wrap]] [--preview-text] [FILE | -- COMMAND...]
 ```
 
 Without FILE, glean reads stdin to EOF. The picker uses the Windows console,
@@ -82,7 +84,8 @@ case: an uppercase ASCII letter makes its term case sensitive.
 
 Type to search. Up/Down (also Ctrl-K/Ctrl-J and Ctrl-P/Ctrl-N) move through the
 results; Page Up/Down move a page. Enter accepts. Esc, Ctrl-C, and Ctrl-G
-cancel. In multi mode, Tab and Shift-Tab toggle a row and move. Left/Right,
+cancel. In multi mode, Tab and Shift-Tab toggle a row and move down or up, and the
+info line counts the marked rows. Left/Right,
 Home/End, and Ctrl-A/Ctrl-E move within the query. Backspace or Ctrl-H deletes
 one character; Ctrl-U clears the query and Ctrl-W deletes a word.
 

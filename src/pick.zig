@@ -1,10 +1,12 @@
-//! The native picker's state, input transitions, theme, and frame renderer.
+//! The native picker's state, input transitions, and frame renderer.
 //! Console handles and input records stay in tui.zig.
 
 const std = @import("std");
 const fuzzy = @import("fuzzy.zig");
 const tui = @import("tui.zig");
 const preview = @import("preview.zig");
+const theme_zig = @import("theme.zig");
+const ansi = @import("ansi.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -14,12 +16,6 @@ pub const CommandPreview = preview.Command;
 pub const PreviewWorker = preview.Worker;
 pub const commandPreviewer = preview.commandPreviewer;
 pub const textPreview = preview.textPreview;
-
-pub const default_colors =
-    "--color=fg:#c0caf5,bg:-1,hl:#2ac3de,fg+:#c0caf5,bg+:#283457 " ++
-    "--color=hl+:#2ac3de,info:#7aa2f7,prompt:#2ac3de,pointer:#ff007c " ++
-    "--color=marker:#ff5da0,spinner:#ff007c,header:#ff9e64,query:#c0caf5 " ++
-    "--color=border:#27a1b9,separator:#ff9e64,gutter:#283457";
 
 pub const Options = struct {
     prompt: []const u8 = "> ",
@@ -33,86 +29,17 @@ pub const Options = struct {
     preview: ?Previewer = null,
     preview_percent: u8 = 40,
     preview_wrap: bool = false,
+    /// fzf's --ansi: rows may carry SGR colors, which are drawn but neither
+    /// matched against nor returned.
+    ansi: bool = false,
 };
+
+pub const default_colors = theme_zig.default_colors;
+pub const Rgb = theme_zig.Rgb;
+pub const Color = theme_zig.Color;
+pub const Theme = theme_zig.Theme;
 
 pub const Outcome = union(enum) { picked: []const u32, cancelled, no_console };
-
-pub const Rgb = struct { r: u8, g: u8, b: u8 };
-pub const Color = union(enum) { terminal, indexed: u8, rgb: Rgb };
-
-pub const Theme = struct {
-    fg: Color = .terminal,
-    fg_plus: Color = .terminal,
-    bg: Color = .terminal,
-    bg_plus: Color = .terminal,
-    hl: Color = .terminal,
-    hl_plus: Color = .terminal,
-    info: Color = .terminal,
-    marker: Color = .terminal,
-    prompt: Color = .terminal,
-    spinner: Color = .terminal,
-    pointer: Color = .terminal,
-    header: Color = .terminal,
-    border: Color = .terminal,
-    separator: Color = .terminal,
-    query: Color = .terminal,
-    gutter: Color = .terminal,
-    label: Color = .terminal,
-
-    pub fn fromEnvironment(extra: ?[]const u8) Theme {
-        var theme: Theme = .{};
-        theme.apply(default_colors);
-        if (extra) |words| theme.apply(words);
-        return theme;
-    }
-
-    /// Only color words affect this parser; other fzf options belong to their
-    /// callers and may appear anywhere in FZF_DEFAULT_OPTS.
-    pub fn apply(self: *Theme, words: []const u8) void {
-        var it = std.mem.tokenizeAny(u8, words, " \t\r\n");
-        while (it.next()) |word| {
-            const specs = if (std.mem.startsWith(u8, word, "--color=")) word[8..] else continue;
-            var parts = std.mem.splitScalar(u8, specs, ',');
-            while (parts.next()) |part| {
-                const colon = std.mem.indexOfScalar(u8, part, ':') orelse continue;
-                const color = parseColor(part[colon + 1 ..]) orelse continue;
-                self.set(part[0..colon], color);
-            }
-        }
-    }
-
-    fn set(self: *Theme, name: []const u8, value: Color) void {
-        const fields = .{
-            .{ "fg", &self.fg },           .{ "fg+", &self.fg_plus },
-            .{ "bg", &self.bg },           .{ "bg+", &self.bg_plus },
-            .{ "hl", &self.hl },           .{ "hl+", &self.hl_plus },
-            .{ "info", &self.info },       .{ "marker", &self.marker },
-            .{ "prompt", &self.prompt },   .{ "spinner", &self.spinner },
-            .{ "pointer", &self.pointer }, .{ "header", &self.header },
-            .{ "border", &self.border },   .{ "separator", &self.separator },
-            .{ "query", &self.query },     .{ "gutter", &self.gutter },
-            .{ "label", &self.label },
-        };
-        inline for (fields) |field| {
-            if (std.mem.eql(u8, name, field[0])) {
-                field[1].* = value;
-                return;
-            }
-        }
-    }
-};
-
-fn parseColor(text: []const u8) ?Color {
-    if (std.mem.eql(u8, text, "-1")) return .terminal;
-    if (text.len == 7 and text[0] == '#') {
-        return .{ .rgb = .{
-            .r = std.fmt.parseInt(u8, text[1..3], 16) catch return null,
-            .g = std.fmt.parseInt(u8, text[3..5], 16) catch return null,
-            .b = std.fmt.parseInt(u8, text[5..7], 16) catch return null,
-        } };
-    }
-    return .{ .indexed = std.fmt.parseInt(u8, text, 10) catch return null };
-}
 
 pub const State = struct {
     arena: Allocator,
@@ -137,6 +64,9 @@ pub const State = struct {
     preview_focus_pending: bool = false,
     producer_running: bool = false,
     spinner_frame: usize = 0,
+    /// Under opts.ansi, each row with its escapes removed, by row id.
+    plain_rows: std.ArrayList([]const u8) = .empty,
+    plain_store: std.heap.ArenaAllocator,
 
     pub fn init(arena: Allocator, rows: []const []const u8, opts: Options) !State {
         const headers = @min(opts.header_lines, rows.len);
@@ -146,12 +76,10 @@ pub const State = struct {
         const marked = try arena.alloc(bool, selectable);
         errdefer arena.free(marked);
         @memset(marked, false);
-        for (rows[headers..], visible) |row, *part| {
-            part.* = fuzzy.visiblePart(row, opts.delimiter, opts.with_nth_from);
-        }
         var state: State = .{
             .arena = arena,
             .scratch = std.heap.ArenaAllocator.init(arena),
+            .plain_store = std.heap.ArenaAllocator.init(arena),
             .rows = rows,
             .visible = visible,
             .visible_buffer = visible,
@@ -160,12 +88,20 @@ pub const State = struct {
             .opts = opts,
         };
         errdefer state.scratch.deinit();
+        errdefer state.plain_store.deinit();
+        errdefer state.plain_rows.deinit(arena);
+        try state.addPlain(rows);
+        for (rows[headers..], visible, headers..) |_, *part, id| {
+            part.* = fuzzy.visiblePart(state.rowText(id), opts.delimiter, opts.with_nth_from);
+        }
         try state.rerank();
         return state;
     }
 
     pub fn deinit(self: *State) void {
         self.scratch.deinit();
+        self.plain_store.deinit();
+        self.plain_rows.deinit(self.arena);
         self.query.deinit(self.arena);
         if (self.rows_buffer) |buffer| self.arena.free(buffer);
         self.arena.free(self.visible_buffer);
@@ -196,15 +132,29 @@ pub const State = struct {
             self.marked_buffer = marked_buffer;
         }
         @memcpy(self.rows_buffer.?[old_len..total], additions);
+        try self.addPlain(additions);
         const headers = @min(self.opts.header_lines, total);
         const selectable = total - headers;
+        self.rows = self.rows_buffer.?[0..total];
         for (self.visible.len..selectable) |index| {
-            self.visible_buffer[index] = fuzzy.visiblePart(self.rows_buffer.?[headers + index], self.opts.delimiter, self.opts.with_nth_from);
+            self.visible_buffer[index] = fuzzy.visiblePart(self.rowText(headers + index), self.opts.delimiter, self.opts.with_nth_from);
             self.marked_buffer[index] = false;
         }
         self.rows = self.rows_buffer.?[0..total];
         self.visible = self.visible_buffer[0..selectable];
         self.marked = self.marked_buffer[0..selectable];
+    }
+
+    fn addPlain(self: *State, additions: []const []const u8) !void {
+        if (!self.opts.ansi) return;
+        try self.plain_rows.ensureUnusedCapacity(self.arena, additions.len);
+        for (additions) |row| self.plain_rows.appendAssumeCapacity(try ansi.strip(self.plain_store.allocator(), row));
+    }
+
+    /// rowText is a row as matched and returned: without its escapes under
+    /// opts.ansi, verbatim otherwise.
+    pub fn rowText(self: *const State, id: usize) []const u8 {
+        return if (self.opts.ansi) self.plain_rows.items[id] else self.rows[id];
     }
 
     pub fn refreshRows(self: *State) !void {
@@ -248,7 +198,7 @@ pub const State = struct {
     pub fn currentRow(self: *const State) ?CurrentRow {
         if (self.current >= self.hits.len) return null;
         const id = @as(usize, self.hits[self.current].index) + @min(self.opts.header_lines, self.rows.len);
-        return .{ .id = id, .text = self.rows[id] };
+        return .{ .id = id, .text = self.rowText(id) };
     }
 
     pub fn setPreview(self: *State, value: PreviewText) void {
@@ -323,13 +273,14 @@ pub const State = struct {
                 self.preview_scroll +|= 1;
                 self.preview_focus_pending = false;
             },
+            // fzf's toggle+down and toggle+up: down as the list is drawn.
             .tab => {
                 self.toggle();
-                if (self.opts.multi) self.move(1);
+                if (self.opts.multi) self.move(-1);
             },
             .backtab => {
                 self.toggle();
-                if (self.opts.multi) self.move(-1);
+                if (self.opts.multi) self.move(1);
             },
             .enter => return try self.picked(),
             .escape, .ctrl_c, .ctrl_g => return .cancelled,
@@ -527,6 +478,17 @@ fn renderRow(out: *std.ArrayList(u8), state: *State, theme: Theme, arena: Alloca
     const scroll_width: usize = if (scrollbar and width > gutter) 1 else 0;
     const text_width = width - gutter - scroll_width;
     const row = state.visible[hit.index];
+    // Under --ansi the row's own colors are decoded per frame, for the few
+    // rows on screen, rather than kept for every row.
+    var decode_arena = std.heap.ArenaAllocator.init(arena);
+    defer decode_arena.deinit();
+    const styles: ?[]const ansi.Style = if (state.opts.ansi) blk: {
+        const headers = @min(state.opts.header_lines, state.rows.len);
+        const decoded_row = try ansi.decode(decode_arena.allocator(), state.rows[headers + hit.index]);
+        const plain = decoded_row.plain;
+        const offset = @intFromPtr(fuzzy.visiblePart(plain, state.opts.delimiter, state.opts.with_nth_from).ptr) - @intFromPtr(plain.ptr);
+        break :blk decoded_row.styles[offset..];
+    } else null;
     var positions: std.ArrayList(usize) = .empty;
     defer positions.deinit(arena);
     _ = try fuzzy.matchRow(state.parsed, row, &positions, arena);
@@ -535,7 +497,10 @@ fn renderRow(out: *std.ArrayList(u8), state: *State, theme: Theme, arena: Alloca
     var used: usize = 0;
     var i: usize = 0;
     var pos: usize = 0;
-    var highlighted = false;
+    // A row's own colors are written as they arrived, so the basic 16 keep
+    // the terminal's palette; the theme's colors go through setColor.
+    const Pen = struct { fg: Color, own: bool = false, bold: bool = false };
+    var shown: Pen = .{ .fg = fg };
     try style(out, arena, colors, fg, bg);
     while (i < row.len) {
         const d = decoded(row, i);
@@ -543,9 +508,18 @@ fn renderRow(out: *std.ArrayList(u8), state: *State, theme: Theme, arena: Alloca
         if (used + w > budget) break;
         while (pos < positions.items.len and positions.items[pos] < i) pos += 1;
         const match = pos < positions.items.len and positions.items[pos] < i + d.len;
-        if (match != highlighted) {
-            if (colors) try setColor(out, arena, if (match) hl else fg, false);
-            highlighted = match;
+        // A match wins over the row's own color, as in fzf.
+        const own: ansi.Style = if (styles) |all| (if (i < all.len) all[i] else .{}) else .{};
+        const want: Pen = if (match)
+            .{ .fg = hl, .bold = own.bold }
+        else if (own.fg) |color|
+            .{ .fg = color, .own = true, .bold = own.bold }
+        else
+            .{ .fg = fg, .bold = own.bold };
+        if (colors and !std.meta.eql(want, shown)) {
+            if (want.bold != shown.bold) try append(out, arena, if (want.bold) "\x1b[1m" else "\x1b[22m");
+            if (want.own) try ansi.writeFg(out, arena, want.fg) else try setColor(out, arena, want.fg, false);
+            shown = want;
         }
         if (d.cp == '\t' or d.cp < 0x20 or d.cp == 0x7f) {
             try append(out, arena, " ");
@@ -555,7 +529,10 @@ fn renderRow(out: *std.ArrayList(u8), state: *State, theme: Theme, arena: Alloca
         used += w;
         i += d.len;
     }
-    if (highlighted and colors) try setColor(out, arena, fg, false);
+    if (colors and !std.meta.eql(shown, Pen{ .fg = fg })) {
+        if (shown.bold) try append(out, arena, "\x1b[22m");
+        try setColor(out, arena, fg, false);
+    }
     if (clipped) {
         try pad(out, arena, used, budget);
         used = budget;
@@ -656,7 +633,7 @@ pub fn render(state: *State, theme: Theme, width: usize, height: usize, colors: 
         } else if (line >= list_start + list_height and line < height -| 2) {
             const header = line - (list_start + list_height);
             try style(&out, arena, colors, theme.header, theme.bg);
-            const text = fuzzy.visiblePart(state.rows[header], state.opts.delimiter, state.opts.with_nth_from);
+            const text = fuzzy.visiblePart(state.rowText(header), state.opts.delimiter, state.opts.with_nth_from);
             // Indented by the rows' gutter, so a header names the columns below it.
             const gutter = @min(width, @as(usize, 3));
             try pad(&out, arena, 0, gutter);
@@ -665,7 +642,10 @@ pub fn render(state: *State, theme: Theme, width: usize, height: usize, colors: 
         } else if (height >= 2 and line == height - 2) {
             try style(&out, arena, colors, theme.info, theme.bg);
             var buf: [64]u8 = undefined;
-            const info = try std.fmt.bufPrint(&buf, "{d}/{d} ", .{ state.hits.len, state.visible.len });
+            const info = if (state.opts.multi)
+                try std.fmt.bufPrint(&buf, "{d}/{d} ({d}) ", .{ state.hits.len, state.visible.len, std.mem.count(bool, state.marked, &.{true}) })
+            else
+                try std.fmt.bufPrint(&buf, "{d}/{d} ", .{ state.hits.len, state.visible.len });
             var used = try plainWidth(&out, arena, info, width);
             if (state.producer_running and used < width) {
                 try style(&out, arena, colors, theme.spinner, theme.bg);

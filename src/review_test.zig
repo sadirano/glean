@@ -106,3 +106,30 @@ test "header lines line up with the rows under them" {
     }
     try std.testing.expectEqual(row_col.?, header_col.?);
 }
+
+test "an ansi row keeps its colors on screen but is matched and returned plain" {
+    const a = std.testing.allocator;
+    var state = try pick.State.init(a, &.{"\x1b[34msrc/a.zig\x1b[0m:\x1b[32m7\x1b[0m:x"}, .{ .ansi = true });
+    defer state.deinit();
+    try std.testing.expectEqualStrings("src/a.zig:7:x", state.currentRow().?.text);
+    try std.testing.expectEqualStrings("src/a.zig:7:x", state.visible[0]);
+    const frame = try pick.render(&state, .{}, 40, 4, true, false, a);
+    defer a.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[34msrc/a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[32m7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[0m:") == null);
+}
+
+test "tab marks and moves down the drawn list, and the info line counts marks" {
+    const a = std.testing.allocator;
+    var state = try pick.State.init(a, &.{ "one", "two", "three" }, .{ .multi = true });
+    defer state.deinit();
+    _ = try state.step(.up);
+    _ = try state.step(.tab);
+    try std.testing.expectEqual(@as(usize, 0), state.current);
+    _ = try state.step(.backtab);
+    try std.testing.expectEqual(@as(usize, 1), state.current);
+    const frame = try pick.render(&state, .{}, 30, 6, false, false, a);
+    defer a.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "3/3 (2)") != null);
+}

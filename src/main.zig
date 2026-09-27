@@ -4,7 +4,7 @@ const stream = @import("stream.zig");
 const pick = @import("pick.zig");
 const fuzzy = @import("fuzzy.zig");
 
-const usage = "usage: glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--max-rows N] [--filter QUERY] [--preview COMMAND | --preview-text] [--preview-window up:N%[:wrap]] [FILE | -- COMMAND...]\n";
+const usage = "usage: glean [--multi] [--ansi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--max-rows N] [--filter QUERY] [--preview COMMAND | --preview-text] [--preview-window up:N%[:wrap]] [FILE | -- COMMAND...]\n";
 
 const FileRows = struct { rows: []const []const u8 };
 
@@ -67,6 +67,10 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
         }
         if (std.mem.eql(u8, arg, "--multi")) {
             opts.multi = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ansi")) {
+            opts.ansi = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--preview-text")) {
@@ -209,7 +213,12 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
         else
             try stream.collect(arena, io, feed);
         const capped = all_rows[0..if (max_rows == 0) all_rows.len else @min(max_rows, all_rows.len)];
-        const rows = capped[@min(opts.header_lines, capped.len)..];
+        const raw_rows = capped[@min(opts.header_lines, capped.len)..];
+        const rows = if (opts.ansi) blk: {
+            const plain = try arena.alloc([]const u8, raw_rows.len);
+            for (raw_rows, plain) |row, *out| out.* = try @import("ansi.zig").strip(arena, row);
+            break :blk plain;
+        } else raw_rows;
         if (rows.len == 0) return 1;
         const query = try fuzzy.parseQuery(arena, text, .smart);
         const visible = try arena.alloc([]const u8, rows.len);
