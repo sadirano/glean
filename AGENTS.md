@@ -1,7 +1,7 @@
 # Contributor guide
 
-Use Zig 0.16. Build the test harness `glean.exe` with `zig build` (never installed or
-exported: the library is the product) and run unit tests with
+Use Zig 0.16. Build the test harness `glean.exe` with `zig build` (exported to
+`~/.nix/bin` for hand testing only: the library is the product) and run unit tests with
 `zig build test`. Run `zig build ci` before handing off a change; it checks
 formatting, tests, the host executable, and Linux compilation.
 

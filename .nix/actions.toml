@@ -1,6 +1,11 @@
 [actions]
-build = "zig build"
+# --sync-bin after the build keeps the global glean.exe in ~/.nix/bin current.
+build = "zig build -Doptimize=ReleaseFast && nix --sync-bin"
 test = "zig build test"
 ci = "zig build ci"
 # Try the picker by hand: x glean :try -- <file> [--multi] [--header-lines N] ...
 try = "zig build && zig-out\bin\glean.exe {args}"
+
+# The test harness on PATH, for trying the picker by hand from anywhere.
+[bin]
+glean = "zig-out/bin/glean.exe"

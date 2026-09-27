@@ -58,8 +58,9 @@ Shift-Up/Shift-Down scroll the pane.
 
 ## Trying it by hand
 
-The repo builds `glean.exe`, a test harness for the library. It is not meant
-to be installed; for a general command-line picker, use fzf.
+The repo builds `glean.exe`, a test harness for the library; `x glean :build`
+also installs it into `~/.nix/bin` for trying it from anywhere. It is not a
+replacement for fzf as a general command-line picker.
 
 ```text
 glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [--max-rows N] [--preview CMD] [--preview-window up:N%[:wrap]] [--preview-text] [FILE | -- COMMAND...]
