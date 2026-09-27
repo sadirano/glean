@@ -79,3 +79,14 @@ test "growing the viewport clamps scroll to a full final page" {
     try std.testing.expectEqual(@as(usize, 52), state.scroll);
     try std.testing.expectEqual(@as(usize, 99), state.current);
 }
+
+test "moving the cursor keeps the old preview where it was until the new one arrives" {
+    const a = std.testing.allocator;
+    var state = try pick.State.init(a, &.{ "alpha", "beta" }, .{});
+    defer state.deinit();
+    state.preview_scroll = 7;
+    _ = try state.step(.up);
+    try std.testing.expectEqual(@as(usize, 7), state.preview_scroll);
+    state.setPreview(.{ .text = "one\ntwo", .focus_line = 2 });
+    try std.testing.expect(state.preview_focus_pending);
+}

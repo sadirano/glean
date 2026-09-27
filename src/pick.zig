@@ -230,7 +230,6 @@ pub const State = struct {
         // unrelated row; fzf goes back to the best match, and so do we.
         self.current = 0;
         self.scroll = 0;
-        self.preview_scroll = 0;
     }
 
     pub fn setHeight(self: *State, height: usize) void {
@@ -273,14 +272,12 @@ pub const State = struct {
 
     fn move(self: *State, delta: isize) void {
         if (self.hits.len == 0) return;
-        const previous = self.current;
         if (delta < 0) {
             self.current -|= @intCast(-delta);
         } else {
             self.current = @min(self.hits.len - 1, self.current +| @as(usize, @intCast(delta)));
         }
         self.keepInView();
-        if (self.current != previous) self.preview_scroll = 0;
     }
 
     fn toggle(self: *State) void {
@@ -699,7 +696,9 @@ pub fn syncPreview(state: *State, worker: *PreviewWorker, last_id: *?usize) !boo
             worker.clear();
             state.preview_text = null;
         }
-        state.preview_scroll = 0;
+        // The old pane stays as it was until the new row's text arrives, as
+        // fzf's does: resetting its scroll here would flash the old file from
+        // its top before setPreview jumps the new one to its focus line.
         last_id.* = id;
         changed = true;
     }
