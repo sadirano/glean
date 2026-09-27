@@ -1,8 +1,8 @@
 # glean
 
 glean is a Zig 0.16 fuzzy picker library with fzf-style queries, for programs
-that want a picker without calling an external one. It reads all input rows
-before opening the picker.
+that want a picker without calling an external one. It supports both a supplied
+list of rows and feeds that stream rows while the picker is open.
 
 ## Library
 
@@ -58,9 +58,10 @@ Shift-Up/Shift-Down scroll the pane.
 
 ## Trying it by hand
 
-The repo builds `glean.exe`, a test harness for the library; `x glean :build`
-also installs it into `~/.nix/bin` for trying it from anywhere. It is not a
-replacement for fzf as a general command-line picker.
+Run `zig build` to build `zig-out/bin/glean.exe`, a test harness for the library.
+For contributors using the nix project runner, `x glean :build` also exports
+the harness through `~/.nix/bin`. It is not a replacement for fzf as a general
+command-line picker.
 
 ```text
 glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [--max-rows N] [--preview CMD] [--preview-window up:N%[:wrap]] [--preview-text] [FILE | -- COMMAND...]
@@ -85,4 +86,4 @@ cancel. In multi mode, Tab and Shift-Tab toggle a row and move. Left/Right,
 Home/End, and Ctrl-A/Ctrl-E move within the query. Backspace or Ctrl-H deletes
 one character; Ctrl-U clears the query and Ctrl-W deletes a word.
 
-The matcher follows fzf by Junegunn Choi; see NOTICE for credit.
+glean follows fzf by Junegunn Choi; see NOTICE for attribution and its MIT license.

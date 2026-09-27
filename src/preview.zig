@@ -121,7 +121,7 @@ pub const Worker = struct {
             const stop = self.stopped;
             const generation = self.generation;
             const request = if (generation != seen) self.request else null;
-            if (generation != seen) self.request = null;
+            if (!stop and generation != seen) self.request = null;
             self.mutex.unlock();
             if (stop) return;
             if (generation == seen or request == null) {
@@ -443,6 +443,16 @@ fn commandRun(ctx: *anyopaque, arena: Allocator, row: []const u8) !PreviewText {
 
 fn emptyPreview(_: *anyopaque, _: Allocator, _: []const u8) anyerror!PreviewText {
     return .{ .text = "" };
+}
+
+test "stopping before a queued request leaves ownership with deinit" {
+    var dummy: u8 = 0;
+    var worker = Worker.init(.{ .ctx = &dummy, .func = emptyPreview });
+    defer worker.deinit();
+    try worker.post(1, "row");
+    worker.stopped = true;
+    worker.run();
+    try std.testing.expect(worker.request != null);
 }
 
 test "preview formatting retains SGR, drops other escapes, and resets lines" {

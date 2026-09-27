@@ -209,12 +209,14 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
         // copying each row as it arrives costs two allocations per row: read
         // a file or a redirected file whole. A command or a pipe still goes
         // through the stream reader, which knows how to drain a Windows pipe.
-        const rows = if (file != null)
+        const all_rows = if (file != null)
             file_rows.rows
         else if (command == null and !stdinIsPipe())
             try splitRows(arena, try readStdin(arena, io))
         else
             try stream.collect(arena, io, feed);
+        const capped = all_rows[0..if (max_rows == 0) all_rows.len else @min(max_rows, all_rows.len)];
+        const rows = capped[@min(opts.header_lines, capped.len)..];
         if (rows.len == 0) return 1;
         const query = try fuzzy.parseQuery(arena, text, .smart);
         const visible = try arena.alloc([]const u8, rows.len);

@@ -6,8 +6,9 @@ pub fn readRune(bytes: []const u8, start: usize) Rune {
     if (bytes[start] < 0x80) return .{ .value = bytes[start], .start = start, .end = start + 1 };
     const length: usize = std.unicode.utf8ByteSequenceLength(bytes[start]) catch 1;
     const end = @min(start + length, bytes.len);
-    const value = std.unicode.utf8Decode(bytes[start..end]) catch @as(u21, bytes[start]);
-    return .{ .value = value, .start = start, .end = if (value == bytes[start] and length != 1) start + 1 else end };
+    const value = std.unicode.utf8Decode(bytes[start..end]) catch
+        return .{ .value = bytes[start], .start = start, .end = start + 1 };
+    return .{ .value = value, .start = start, .end = end };
 }
 
 pub fn previousRune(bytes: []const u8, end: usize) Rune {
@@ -168,4 +169,11 @@ pub fn bonus(prev: CharClass, current: CharClass) i32 {
 pub fn bonusAt(row: []const u8, pos: usize) i32 {
     const prev: CharClass = if (pos == 0) .white else charClass(previousRune(row, pos).value);
     return bonus(prev, charClass(readRune(row, pos).value));
+}
+
+test "valid UTF-8 consumes the whole rune even when it equals the lead byte" {
+    const rune = readRune("\u{00c3}", 0);
+    try std.testing.expectEqual(@as(usize, 2), rune.end);
+    try std.testing.expectEqual(@as(u21, 0xc3), rune.value);
+    try std.testing.expectEqual(@as(usize, 1), readRune("\xc3(", 0).end);
 }

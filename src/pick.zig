@@ -142,7 +142,9 @@ pub const State = struct {
         const headers = @min(opts.header_lines, rows.len);
         const selectable = rows.len - headers;
         const visible = try arena.alloc([]const u8, selectable);
+        errdefer arena.free(visible);
         const marked = try arena.alloc(bool, selectable);
+        errdefer arena.free(marked);
         @memset(marked, false);
         for (rows[headers..], visible) |row, *part| {
             part.* = fuzzy.visiblePart(row, opts.delimiter, opts.with_nth_from);
@@ -266,6 +268,7 @@ pub const State = struct {
         const capacity = @max(1, self.listHeight());
         if (self.current < self.scroll) self.scroll = self.current;
         if (self.current >= self.scroll +| capacity) self.scroll = self.current - capacity + 1;
+        self.scroll = @min(self.scroll, self.hits.len -| capacity);
     }
 
     fn move(self: *State, delta: isize) void {
@@ -397,9 +400,16 @@ const unicode_glyphs: Glyphs = .{
 const ascii_glyphs: Glyphs = .{ .pointer = ">", .marker = "*", .separator = "-", .scroll = "|", .spinner = &.{ "-", "\\", "|", "/" } };
 
 fn decoded(s: []const u8, index: usize) struct { cp: u21, len: usize } {
-    const len = std.unicode.utf8ByteSequenceLength(s[index]) catch return .{ .cp = s[index], .len = 1 };
-    if (index + len > s.len) return .{ .cp = s[index], .len = 1 };
-    return .{ .cp = std.unicode.utf8Decode(s[index .. index + len]) catch s[index], .len = len };
+    const len = std.unicode.utf8ByteSequenceLength(s[index]) catch return .{ .cp = '?', .len = 1 };
+    if (index + len > s.len) return .{ .cp = '?', .len = 1 };
+    const cp = std.unicode.utf8Decode(s[index .. index + len]) catch return .{ .cp = '?', .len = 1 };
+    return .{ .cp = cp, .len = len };
+}
+
+fn appendRune(out: *std.ArrayList(u8), arena: Allocator, cp: u21) !void {
+    var bytes: [4]u8 = undefined;
+    const length = try std.unicode.utf8Encode(cp, &bytes);
+    try out.appendSlice(arena, bytes[0..length]);
 }
 
 fn columns(cp: u21) usize {
@@ -481,7 +491,7 @@ fn plainWidth(out: *std.ArrayList(u8), arena: Allocator, s: []const u8, width: u
         if (d.cp == '\t' or d.cp < 0x20 or d.cp == 0x7f) {
             try append(out, arena, " ");
         } else {
-            try append(out, arena, s[i .. i + d.len]);
+            try appendRune(out, arena, d.cp);
         }
         used += w;
         i += d.len;
@@ -543,7 +553,7 @@ fn renderRow(out: *std.ArrayList(u8), state: *State, theme: Theme, arena: Alloca
         if (d.cp == '\t' or d.cp < 0x20 or d.cp == 0x7f) {
             try append(out, arena, " ");
         } else {
-            try append(out, arena, row[i .. i + d.len]);
+            try appendRune(out, arena, d.cp);
         }
         used += w;
         i += d.len;

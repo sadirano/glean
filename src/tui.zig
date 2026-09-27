@@ -243,6 +243,7 @@ pub const Console = struct {
 
     fn translate(self: *Console, event: KeyEventRecord) ?Key {
         const vk = event.wVirtualKeyCode;
+        if (event.uChar < 0xd800 or event.uChar > 0xdfff) self.pending_high = null;
         // AltGr arrives as Ctrl+Alt, and on layouts like ABNT2 AltGr+W types
         // `?`: with Alt also down and a character produced, it is typing.
         const alt = event.dwControlKeyState & (left_alt_pressed | right_alt_pressed) != 0;
@@ -319,4 +320,24 @@ test "InputRecord matches the Win32 console layout" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(KeyEventRecord));
     try std.testing.expectEqual(@as(usize, 20), @sizeOf(InputRecord));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(InputRecord, "Event"));
+}
+
+test "surrogates do not pair across navigation and AltGr remains text" {
+    var console: Console = .{ .input = @ptrFromInt(1), .output = @ptrFromInt(1), .input_mode = 0, .output_mode = 0 };
+    var event: KeyEventRecord = .{ .bKeyDown = 1, .wRepeatCount = 1, .wVirtualKeyCode = 0, .wVirtualScanCode = 0, .uChar = 0xd83d, .dwControlKeyState = 0 };
+    try std.testing.expect(console.translate(event) == null);
+    event.uChar = 0;
+    event.wVirtualKeyCode = 0x26;
+    try std.testing.expect(console.translate(event).? == .up);
+    event.uChar = 0xde00;
+    event.wVirtualKeyCode = 0;
+    try std.testing.expect(console.translate(event) == null);
+    event.uChar = 0xd83d;
+    try std.testing.expect(console.translate(event) == null);
+    event.uChar = 0xde00;
+    try std.testing.expectEqual(@as(u21, 0x1f600), console.translate(event).?.character);
+    event.uChar = '?';
+    event.wVirtualKeyCode = 'W';
+    event.dwControlKeyState = left_ctrl_pressed | right_alt_pressed;
+    try std.testing.expectEqual(@as(u21, '?'), console.translate(event).?.character);
 }

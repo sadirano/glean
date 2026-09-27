@@ -190,6 +190,7 @@ pub fn rank(arena: std.mem.Allocator, query: Query, rows: []const []const u8) ![
     }
 
     const workers = try arena.alloc(RankWorker, worker_count);
+    defer arena.free(workers);
     var initialized: usize = 0;
     defer for (workers[0..initialized]) |*worker| worker.local_arena.deinit();
     const chunk = (rows.len + worker_count - 1) / worker_count;
@@ -204,6 +205,7 @@ pub fn rank(arena: std.mem.Allocator, query: Query, rows: []const []const u8) ![
         initialized += 1;
     }
     const threads = try arena.alloc(std.Thread, worker_count - 1);
+    defer arena.free(threads);
     var started: usize = 0;
     for (workers[1..]) |*worker| {
         threads[started] = std.Thread.spawn(.{}, RankWorker.run, .{worker}) catch {
