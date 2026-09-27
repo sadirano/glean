@@ -36,13 +36,22 @@ switch (result) {
 The returned indices refer to the original rows. Pass `Options.colors` to
 apply `--color=` words over the built-in palette.
 
+## Streaming rows
+
+`glean.stream.pickFeed(arena, io, feed, opts)` shows rows while they arrive and
+returns the picked rows as text. A `Feed` takes its rows from a child process
+(`.command`, its stdout lines), this process's stdin (`.stdin`), or a function
+that pushes rows itself (`.callback`, e.g. a directory walker; stop when
+`sink.push` returns false). `filter` drops or rewrites lines, `max_rows` stops
+the source after that many kept rows, and `collect` runs a feed with no UI.
+
 ## Trying it by hand
 
 The repo builds `glean.exe`, a test harness for the library. It is not meant
 to be installed; for a general command-line picker, use fzf.
 
 ```text
-glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [FILE]
+glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [--max-rows N] [FILE | -- COMMAND...]
 ```
 
 Without FILE, glean reads stdin to EOF. The picker uses the Windows console,

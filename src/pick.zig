@@ -107,8 +107,11 @@ pub const State = struct {
     arena: Allocator,
     scratch: std.heap.ArenaAllocator,
     rows: []const []const u8,
-    visible: []const []const u8,
+    rows_buffer: ?[][]const u8 = null,
+    visible: [][]const u8,
+    visible_buffer: [][]const u8,
     marked: []bool,
+    marked_buffer: []bool,
     opts: Options,
     query: std.ArrayList(u8) = .empty,
     query_cursor: usize = 0,
@@ -118,6 +121,8 @@ pub const State = struct {
     scroll: usize = 0,
     screen_height: usize = 24,
     preview_height: usize = 0,
+    producer_running: bool = false,
+    spinner_frame: usize = 0,
 
     pub fn init(arena: Allocator, rows: []const []const u8, opts: Options) !State {
         const headers = @min(opts.header_lines, rows.len);
@@ -133,7 +138,9 @@ pub const State = struct {
             .scratch = std.heap.ArenaAllocator.init(arena),
             .rows = rows,
             .visible = visible,
+            .visible_buffer = visible,
             .marked = marked,
+            .marked_buffer = marked,
             .opts = opts,
         };
         errdefer state.scratch.deinit();
@@ -144,8 +151,58 @@ pub const State = struct {
     pub fn deinit(self: *State) void {
         self.scratch.deinit();
         self.query.deinit(self.arena);
-        self.arena.free(self.visible);
-        self.arena.free(self.marked);
+        if (self.rows_buffer) |buffer| self.arena.free(buffer);
+        self.arena.free(self.visible_buffer);
+        self.arena.free(self.marked_buffer);
+    }
+
+    pub fn appendRows(self: *State, additions: []const []const u8) !void {
+        if (additions.len == 0) return;
+        const old_len = self.rows.len;
+        const total = try std.math.add(usize, old_len, additions.len);
+        const capacity = if (self.rows_buffer) |buffer| buffer.len else 0;
+        if (total > capacity) {
+            const new_capacity = @max(total, @max(@as(usize, 16), capacity *| 2));
+            const rows_buffer = try self.arena.alloc([]const u8, new_capacity);
+            errdefer self.arena.free(rows_buffer);
+            const visible_buffer = try self.arena.alloc([]const u8, new_capacity);
+            errdefer self.arena.free(visible_buffer);
+            const marked_buffer = try self.arena.alloc(bool, new_capacity);
+            errdefer self.arena.free(marked_buffer);
+            @memcpy(rows_buffer[0..old_len], self.rows);
+            @memcpy(visible_buffer[0..self.visible.len], self.visible);
+            @memcpy(marked_buffer[0..self.marked.len], self.marked);
+            if (self.rows_buffer) |old| self.arena.free(old);
+            self.arena.free(self.visible_buffer);
+            self.arena.free(self.marked_buffer);
+            self.rows_buffer = rows_buffer;
+            self.visible_buffer = visible_buffer;
+            self.marked_buffer = marked_buffer;
+        }
+        @memcpy(self.rows_buffer.?[old_len..total], additions);
+        const headers = @min(self.opts.header_lines, total);
+        const selectable = total - headers;
+        for (self.visible.len..selectable) |index| {
+            self.visible_buffer[index] = fuzzy.visiblePart(self.rows_buffer.?[headers + index], self.opts.delimiter, self.opts.with_nth_from);
+            self.marked_buffer[index] = false;
+        }
+        self.rows = self.rows_buffer.?[0..total];
+        self.visible = self.visible_buffer[0..selectable];
+        self.marked = self.marked_buffer[0..selectable];
+    }
+
+    pub fn refreshRows(self: *State) !void {
+        const selected = if (self.current < self.hits.len) self.hits[self.current].index else null;
+        try self.rerank();
+        if (selected) |index| {
+            for (self.hits, 0..) |hit, position| {
+                if (hit.index == index) {
+                    self.current = position;
+                    self.keepInView();
+                    break;
+                }
+            }
+        }
     }
 
     fn rerank(self: *State) !void {
@@ -284,9 +341,15 @@ fn nextCodepoint(s: []const u8, pos: usize) usize {
 // These glyphs are safe despite the repository's ASCII-output convention:
 // tui writes the completed frame through WriteConsoleW as UTF-16, bypassing
 // legacy console code pages. Source uses escapes so it remains ASCII.
-const Glyphs = struct { pointer: []const u8, marker: []const u8, separator: []const u8, scroll: []const u8 };
-const unicode_glyphs: Glyphs = .{ .pointer = "\u{258C}", .marker = "\u{2503}", .separator = "\u{2500}", .scroll = "\u{2502}" };
-const ascii_glyphs: Glyphs = .{ .pointer = ">", .marker = "*", .separator = "-", .scroll = "|" };
+const Glyphs = struct { pointer: []const u8, marker: []const u8, separator: []const u8, scroll: []const u8, spinner: []const []const u8 };
+const unicode_glyphs: Glyphs = .{
+    .pointer = "\u{258C}",
+    .marker = "\u{2503}",
+    .separator = "\u{2500}",
+    .scroll = "\u{2502}",
+    .spinner = &.{ "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280F}" },
+};
+const ascii_glyphs: Glyphs = .{ .pointer = ">", .marker = "*", .separator = "-", .scroll = "|", .spinner = &.{ "-", "\\", "|", "/" } };
 
 fn decoded(s: []const u8, index: usize) struct { cp: u21, len: usize } {
     const len = std.unicode.utf8ByteSequenceLength(s[index]) catch return .{ .cp = s[index], .len = 1 };
@@ -514,7 +577,16 @@ pub fn render(state: *State, theme: Theme, width: usize, height: usize, colors: 
             try style(&out, arena, colors, theme.info, theme.bg);
             var buf: [64]u8 = undefined;
             const info = try std.fmt.bufPrint(&buf, "{d}/{d} ", .{ state.hits.len, state.visible.len });
-            const used = try plainWidth(&out, arena, info, width);
+            var used = try plainWidth(&out, arena, info, width);
+            if (state.producer_running and used < width) {
+                try style(&out, arena, colors, theme.spinner, theme.bg);
+                const spinner = glyphs.spinner[state.spinner_frame % glyphs.spinner.len];
+                used += try plainWidth(&out, arena, spinner, width - used);
+                if (used < width) {
+                    try append(&out, arena, " ");
+                    used += 1;
+                }
+            }
             try style(&out, arena, colors, theme.separator, theme.bg);
             for (used..width) |_| try append(&out, arena, glyphs.separator);
         } else if (line == height - 1) {
@@ -680,6 +752,23 @@ test "header lines render and cannot be selected" {
     const frame = try render(&state, .{}, 40, 10, false, true, a);
     defer a.free(frame);
     try std.testing.expect(std.mem.indexOf(u8, frame, "heading") != null);
+    const result = (try state.step(.enter)).?;
+    try std.testing.expectEqualSlices(u32, &.{1}, result.picked);
+    a.free(result.picked);
+}
+
+test "appended rows preserve marks and the selected row" {
+    const a = std.testing.allocator;
+    var state = try State.init(a, &.{}, .{ .multi = true });
+    defer state.deinit();
+    try state.appendRows(&.{ "one", "two" });
+    try state.refreshRows();
+    _ = try state.step(.up);
+    _ = try state.step(.tab);
+    try std.testing.expect(state.marked[1]);
+    try state.appendRows(&.{ "three", "four" });
+    try state.refreshRows();
+    try std.testing.expect(state.marked[1]);
     const result = (try state.step(.enter)).?;
     try std.testing.expectEqualSlices(u32, &.{1}, result.picked);
     a.free(result.picked);

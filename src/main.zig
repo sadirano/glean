@@ -1,8 +1,16 @@
 const std = @import("std");
+const stream = @import("stream.zig");
 const pick = @import("pick.zig");
 const fuzzy = @import("fuzzy.zig");
 
-const usage = "usage: glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--filter QUERY] [FILE]\n";
+const usage = "usage: glean [--multi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--max-rows N] [--filter QUERY] [FILE | -- COMMAND...]\n";
+
+const FileRows = struct { rows: []const []const u8 };
+
+fn pushFileRows(ctx: *anyopaque, sink: *stream.Sink) anyerror!void {
+    const source: *FileRows = @ptrCast(@alignCast(ctx));
+    for (source.rows) |row| if (!sink.push(row)) break;
+}
 
 pub fn main(init: std.process.Init) !void {
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -21,9 +29,20 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
     var opts: pick.Options = .{};
     var file: ?[]const u8 = null;
     var filter: ?[]const u8 = null;
+    var command: ?[]const []const u8 = null;
+    var max_rows: usize = 0;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+        if (std.mem.eql(u8, arg, "--")) {
+            if (file != null or i + 1 >= args.len) {
+                try err.writeAll(usage);
+                try err.flush();
+                return 2;
+            }
+            command = args[i + 1 ..];
+            break;
+        }
         if (std.mem.eql(u8, arg, "--multi")) {
             opts.multi = true;
             continue;
@@ -33,6 +52,7 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
                 !std.mem.eql(u8, arg, "--header-lines") and
                 !std.mem.eql(u8, arg, "--delimiter") and
                 !std.mem.eql(u8, arg, "--with-nth") and
+                !std.mem.eql(u8, arg, "--max-rows") and
                 !std.mem.eql(u8, arg, "--filter"))
             {
                 try err.print("glean: unknown option {s}\n", .{arg});
@@ -48,6 +68,12 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
             const value = args[i];
             if (std.mem.eql(u8, arg, "--filter")) {
                 filter = value;
+            } else if (std.mem.eql(u8, arg, "--max-rows")) {
+                max_rows = std.fmt.parseInt(usize, value, 10) catch {
+                    try err.print("glean: invalid value for {s}: {s}\n", .{ arg, value });
+                    try err.flush();
+                    return 2;
+                };
             } else if (std.mem.eql(u8, arg, "--prompt")) {
                 opts.prompt = value;
             } else if (std.mem.eql(u8, arg, "--header-lines")) {
@@ -95,47 +121,56 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
     }
 
     opts.colors = init.minimal.environ.getAlloc(arena, "FZF_DEFAULT_OPTS") catch null;
-    const bytes = if (file) |path|
-        try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited)
-    else blk: {
-        var stdin_buffer: [4096]u8 = undefined;
-        var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
-        break :blk try stdin_reader.interface.allocRemaining(arena, .unlimited);
-    };
-    var rows: std.ArrayList([]const u8) = .empty;
-    if (bytes.len != 0) {
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
-        while (lines.next()) |line| {
-            if (lines.index == null and line.len == 0 and bytes[bytes.len - 1] == '\n') break;
-            try rows.append(arena, std.mem.trimEnd(u8, line, "\r"));
+    var file_rows: FileRows = .{ .rows = &.{} };
+    if (file) |path| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
+        var rows: std.ArrayList([]const u8) = .empty;
+        if (bytes.len != 0) {
+            var lines = std.mem.splitScalar(u8, bytes, '\n');
+            while (lines.next()) |line| {
+                if (lines.index == null and line.len == 0 and bytes[bytes.len - 1] == '\n') break;
+                try rows.append(arena, std.mem.trimEnd(u8, line, "\r"));
+            }
         }
+        file_rows.rows = rows.items;
     }
-    if (rows.items.len == 0) return 1;
+    const feed: stream.Feed = .{
+        .source = if (command) |argv|
+            .{ .command = .{ .argv = argv } }
+        else if (file != null)
+            .{ .callback = .{ .ctx = &file_rows, .func = pushFileRows } }
+        else
+            .stdin,
+        .max_rows = max_rows,
+    };
 
     // fzf's --filter: rank without a UI, so the matcher can be compared
     // against fzf on the same input, for speed and for ranking.
     if (filter) |text| {
+        const rows = try stream.collect(arena, io, feed);
+        if (rows.len == 0) return 1;
         const query = try fuzzy.parseQuery(arena, text, .smart);
-        const visible = try arena.alloc([]const u8, rows.items.len);
-        for (rows.items, visible) |row, *part| part.* = fuzzy.visiblePart(row, opts.delimiter, opts.with_nth_from);
+        const visible = try arena.alloc([]const u8, rows.len);
+        for (rows, visible) |row, *part| part.* = fuzzy.visiblePart(row, opts.delimiter, opts.with_nth_from);
         const hits = try fuzzy.rank(arena, query, visible);
         var out_buffer: [64 * 1024]u8 = undefined;
         var out_writer = std.Io.File.stdout().writer(io, &out_buffer);
-        for (hits) |hit| try out_writer.interface.print("{s}\n", .{rows.items[hit.index]});
+        for (hits) |hit| try out_writer.interface.print("{s}\n", .{rows[hit.index]});
         try out_writer.interface.flush();
         return if (hits.len == 0) 1 else 0;
     }
 
-    switch (try pick.pick(arena, rows.items, opts)) {
-        .picked => |indices| {
-            if (indices.len == 0) return 1;
+    switch (try stream.pickFeed(arena, io, feed, opts)) {
+        .picked => |rows| {
+            if (rows.len == 0) return 1;
             var stdout_buffer: [4096]u8 = undefined;
             var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
-            for (indices) |index| try stdout_writer.interface.print("{s}\n", .{rows.items[index]});
+            for (rows) |row| try stdout_writer.interface.print("{s}\n", .{row});
             try stdout_writer.interface.flush();
             return 0;
         },
         .cancelled => return 130,
         .no_console => return 2,
+        .empty => return 1,
     }
 }

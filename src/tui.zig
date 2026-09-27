@@ -61,6 +61,7 @@ extern "kernel32" fn SetConsoleCursorInfo(handle: Handle, info: *const CursorInf
 extern "kernel32" fn SetConsoleCursorPosition(handle: Handle, position: Coord) callconv(.winapi) i32;
 extern "kernel32" fn SetConsoleActiveScreenBuffer(handle: Handle) callconv(.winapi) i32;
 extern "kernel32" fn ReadConsoleInputW(handle: Handle, records: [*]InputRecord, length: u32, read: *u32) callconv(.winapi) i32;
+extern "kernel32" fn WaitForSingleObject(handle: Handle, milliseconds: u32) callconv(.winapi) u32;
 extern "kernel32" fn WriteConsoleW(handle: Handle, buffer: [*]const u16, length: u32, written: *u32, reserved: ?*anyopaque) callconv(.winapi) i32;
 
 pub const Key = union(enum) {
@@ -215,6 +216,27 @@ pub const Console = struct {
             self.repeat_left = event.wRepeatCount -| 1;
             return key;
         }
+    }
+
+    pub fn pollKey(self: *Console, timeout_ms: u32) !?Key {
+        if (builtin.os.tag != .windows) return error.Unsupported;
+        if (self.repeat_left > 0) {
+            self.repeat_left -= 1;
+            return self.repeated.?;
+        }
+        const result = WaitForSingleObject(self.input, timeout_ms);
+        if (result == 258) return null;
+        if (result != 0) return error.ConsoleRead;
+        var record: InputRecord = undefined;
+        var count: u32 = 0;
+        if (ReadConsoleInputW(self.input, @ptrCast(&record), 1, &count) == 0 or count == 0) return error.ConsoleRead;
+        if (record.EventType == window_buffer_size_event) return .resize;
+        if (record.EventType != key_event or record.Event.key.bKeyDown == 0) return null;
+        const event = record.Event.key;
+        const key = self.translate(event) orelse return null;
+        self.repeated = key;
+        self.repeat_left = event.wRepeatCount -| 1;
+        return key;
     }
 
     fn translate(self: *Console, event: KeyEventRecord) ?Key {
