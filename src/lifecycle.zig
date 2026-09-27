@@ -15,6 +15,14 @@ pub fn sleepMs(milliseconds: u32) void {
     }
 }
 
+/// waitExit blocks until the child exits or `milliseconds` pass, without
+/// reaping it; off Windows it can only sleep.
+pub fn waitExit(child: *const std.process.Child, milliseconds: u32) void {
+    if (builtin.os.tag == .windows) {
+        _ = WaitForSingleObject(child.id.?, milliseconds);
+    } else sleepMs(milliseconds);
+}
+
 // Readiness does not reap: ownership stays with the atomic state machine.
 pub fn exited(child: *const std.process.Child) bool {
     if (builtin.os.tag == .windows) {

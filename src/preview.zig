@@ -17,6 +17,21 @@ fn sleepMs(milliseconds: u32) void {
     }
 }
 
+/// Job is the request a preview callback is serving, so a command it runs
+/// can notice the cursor has moved on and stop early.
+const Job = struct {
+    worker: *Worker,
+    generation: usize,
+
+    fn superseded(self: Job) bool {
+        self.worker.mutex.lock();
+        defer self.worker.mutex.unlock();
+        return self.worker.stopped or self.worker.generation != self.generation;
+    }
+};
+
+threadlocal var current_job: ?Job = null;
+
 pub const PreviewText = struct {
     /// SGR is retained by the renderer; other terminal escapes are dropped.
     text: []const u8,
@@ -129,22 +144,18 @@ pub const Worker = struct {
             self.mutex.unlock();
             if (stop) return;
             if (generation == seen or request == null) {
-                sleepMs(5);
+                sleepMs(2);
                 seen = generation;
                 continue;
             }
             seen = generation;
             const work = request.?;
-            // One quiet interval coalesces rapid cursor changes without delaying typing.
-            sleepMs(30);
-            self.mutex.lock();
-            const obsolete = self.stopped or self.generation != generation;
-            self.mutex.unlock();
-            if (obsolete) {
-                worker_allocator.free(work.row);
-                continue;
-            }
+            // No quiet interval: a preview starts at once, and one the cursor
+            // has already left is abandoned (a command preview kills its
+            // child) rather than waited out.
             var arena = std.heap.ArenaAllocator.init(worker_allocator);
+            current_job = .{ .worker = self, .generation = generation };
+            defer current_job = null;
             const value = self.previewer.func(self.previewer.ctx, arena.allocator(), work.row) catch |err| blk: {
                 const message = std.fmt.allocPrint(arena.allocator(), "preview: {s}", .{@errorName(err)}) catch "preview: out of memory";
                 break :blk PreviewText{ .text = message };
@@ -378,6 +389,7 @@ const Watchdog = struct {
     child: *std.process.Child,
     io: std.Io,
     timeout_ms: u32,
+    job: ?Job = null,
     state: std.atomic.Value(State) = .init(.running),
     gate: Mutex = .{},
 
@@ -394,6 +406,7 @@ const Watchdog = struct {
         var waited: u32 = 0;
         while (waited < self.timeout_ms) {
             if (self.state.load(.acquire) != .running) return;
+            if (self.job) |job| if (job.superseded()) break;
             const interval = @min(10, self.timeout_ms - waited);
             sleepMs(interval);
             waited += interval;
@@ -421,7 +434,7 @@ fn commandRun(ctx: *anyopaque, arena: Allocator, row: []const u8) !PreviewText {
     // Keep the reader's handle alive while the watchdog reaps the child.
     child.stdout = null;
     defer output.close(command.io);
-    var watchdog: Watchdog = .{ .child = &child, .io = command.io, .timeout_ms = command.timeout_ms };
+    var watchdog: Watchdog = .{ .child = &child, .io = command.io, .timeout_ms = command.timeout_ms, .job = current_job };
     const thread = std.Thread.spawn(.{}, Watchdog.run, .{&watchdog}) catch |err| {
         child.kill(command.io);
         return err;
@@ -448,7 +461,7 @@ fn commandRun(ctx: *anyopaque, arena: Allocator, row: []const u8) !PreviewText {
             _ = try child.wait(command.io);
             return .{ .text = try out.toOwnedSlice(arena) };
         }
-        sleepMs(5);
+        lifecycle.waitExit(&child, 5);
     }
     return .{ .text = "(preview timed out)" };
 }
@@ -570,4 +583,27 @@ test "harness preview passes shell metacharacters as one literal argument" {
     const row = "a&echo R1_INJECTED";
     const result = try commandRun(&command, arena.allocator(), row);
     try std.testing.expectEqualStrings(row, result.text);
+}
+
+test "a command preview the cursor has left is killed, so the next row's preview is not held up" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var command: Command = .{
+        .io = std.testing.io,
+        .argv = &.{ "python", "-c", "import sys,time\nif sys.argv[1]=='slow': time.sleep(5)\nprint(sys.argv[1])", "{}" },
+        .timeout_ms = 10_000,
+    };
+    var worker = Worker.init(commandPreviewer(&command));
+    try worker.start();
+    defer worker.deinit();
+    try worker.post(1, "slow");
+    sleepMs(500);
+    try worker.post(2, "fast");
+    const started = lifecycle.GetTickCount64();
+    while (lifecycle.GetTickCount64() - started < 3000) : (sleepMs(10)) {
+        if (worker.take(2)) |value| {
+            try std.testing.expect(std.mem.startsWith(u8, value.text, "fast"));
+            return;
+        }
+    }
+    return error.TestExpectedPreview;
 }
