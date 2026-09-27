@@ -35,6 +35,9 @@ pub const Options = struct {
     preview: ?Previewer = null,
     preview_percent: u8 = 40,
     preview_wrap: bool = false,
+    /// Finished previews kept by row, so going back to a row is instant
+    /// (0 keeps none, the default: a preview of changing data would go stale).
+    preview_cache: usize = 0,
     preview_header_lines: usize = 0,
     /// fzf's --ansi: rows may carry SGR colors, which are drawn but neither
     /// matched against nor returned.
@@ -694,6 +697,7 @@ pub fn pick(arena: Allocator, rows: []const []const u8, opts: Options) !Outcome 
     var frame_arena = std.heap.ArenaAllocator.init(arena);
     defer frame_arena.deinit();
     var worker: ?PreviewWorker = if (opts.preview) |callback| PreviewWorker.init(callback) else null;
+    if (worker) |*active| active.cache_limit = opts.preview_cache;
     if (worker) |*active| try active.start();
     defer if (worker) |*active| active.deinit();
     var last_id: ?usize = null;

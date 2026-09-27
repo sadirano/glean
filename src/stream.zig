@@ -347,6 +347,7 @@ pub fn pickFeed(arena: Allocator, io: std.Io, feed: Feed, opts: pick.Options) !F
     var frame_arena = std.heap.ArenaAllocator.init(arena);
     defer frame_arena.deinit();
     var preview_worker: ?pick.PreviewWorker = if (opts.preview) |callback| pick.PreviewWorker.init(callback) else null;
+    if (preview_worker) |*worker| worker.cache_limit = opts.preview_cache;
     if (preview_worker) |*worker| try worker.start();
     defer if (preview_worker) |*worker| worker.deinit();
     var last_preview_id: ?usize = null;

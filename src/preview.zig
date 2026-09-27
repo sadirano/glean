@@ -65,6 +65,23 @@ const Mutex = struct {
 };
 
 const Request = struct { id: usize, row: []u8 };
+
+/// A preview that ran out of time is shown but never kept.
+const timed_out: []const u8 = "(preview timed out)";
+
+/// The most previews a worker keeps for rows it may be asked for again.
+pub const max_cached = 64;
+
+const Cached = struct {
+    row: []u8,
+    arena: std.heap.ArenaAllocator,
+    value: PreviewText,
+
+    fn deinit(self: *Cached) void {
+        worker_allocator.free(self.row);
+        self.arena.deinit();
+    }
+};
 const Result = struct {
     id: usize,
     arena: std.heap.ArenaAllocator,
@@ -87,6 +104,12 @@ pub const Worker = struct {
     /// Signalled on every publication (Windows), so the frame loop can wait
     /// on input and previews at once instead of polling for either.
     wake: ?*anyopaque = null,
+    /// How many finished previews to keep, by row text, so returning to a row
+    /// shows it without running the previewer again (0 keeps none). Only
+    /// the worker thread touches the cache.
+    cache_limit: usize = 0,
+    cache: [max_cached]?Cached = @splat(null),
+    cache_next: usize = 0,
 
     pub fn init(previewer: Previewer) Worker {
         return .{ .previewer = previewer };
@@ -142,6 +165,28 @@ pub const Worker = struct {
         if (self.request) |request| worker_allocator.free(request.row);
         if (self.published) |*result| result.deinit();
         if (self.displayed) |*result| result.deinit();
+        for (&self.cache) |*slot| if (slot.*) |*entry| entry.deinit();
+    }
+
+    fn cached(self: *Worker, row: []const u8) ?PreviewText {
+        for (self.cache[0..@min(self.cache_limit, max_cached)]) |slot| {
+            if (slot) |entry| if (std.mem.eql(u8, entry.row, row)) return entry.value;
+        }
+        return null;
+    }
+
+    /// remember keeps a copy of a completed preview, replacing the oldest
+    /// once the cache is full. A row already kept is left as it is.
+    fn remember(self: *Worker, row: []const u8, value: PreviewText) void {
+        const limit = @min(self.cache_limit, max_cached);
+        if (limit == 0 or self.cached(row) != null) return;
+        var arena = std.heap.ArenaAllocator.init(worker_allocator);
+        const text = arena.allocator().dupe(u8, value.text) catch return arena.deinit();
+        const key = worker_allocator.dupe(u8, row) catch return arena.deinit();
+        const slot = &self.cache[self.cache_next % limit];
+        if (slot.*) |*old| old.deinit();
+        slot.* = .{ .row = key, .arena = arena, .value = .{ .text = text, .focus_line = value.focus_line } };
+        self.cache_next +%= 1;
     }
 
     fn run(self: *Worker) void {
@@ -167,10 +212,18 @@ pub const Worker = struct {
             var arena = std.heap.ArenaAllocator.init(worker_allocator);
             current_job = .{ .worker = self, .generation = generation };
             defer current_job = null;
-            const value = self.previewer.func(self.previewer.ctx, arena.allocator(), work.row) catch |err| blk: {
+            var fresh = false;
+            const value = if (self.cached(work.row)) |hit| blk: {
+                const text = arena.allocator().dupe(u8, hit.text) catch "";
+                break :blk PreviewText{ .text = text, .focus_line = hit.focus_line };
+            } else self.previewer.func(self.previewer.ctx, arena.allocator(), work.row) catch |err| blk: {
                 const message = std.fmt.allocPrint(arena.allocator(), "preview: {s}", .{@errorName(err)}) catch "preview: out of memory";
                 break :blk PreviewText{ .text = message };
             };
+            if (value.text.ptr != timed_out.ptr and !std.mem.startsWith(u8, value.text, "preview: ")) fresh = true;
+            // Copied before publishing: once published, the frame loop owns
+            // the result and may free it.
+            if (fresh) self.remember(work.row, value);
             worker_allocator.free(work.row);
             self.mutex.lock();
             if (!self.stopped and self.generation == generation) {
@@ -202,10 +255,14 @@ fn columns(cp: u21) usize {
     return 1;
 }
 
-fn finishLine(arena: Allocator, lines: *std.ArrayList(VisualLine), line: *std.ArrayList(u8), used: usize, colors: bool, source: usize, focus: ?usize, focus_row: *?usize) !void {
+/// finishLine closes a visual line with a reset, then opens the next one with
+/// the SGR state still in force, so a color survives a wrap or a newline as
+/// it would on a terminal.
+fn finishLine(arena: Allocator, lines: *std.ArrayList(VisualLine), line: *std.ArrayList(u8), used: usize, colors: bool, source: usize, focus: ?usize, focus_row: *?usize, active: []const u8) !void {
     if (focus_row.* == null and focus != null and source == focus.?) focus_row.* = lines.items.len;
     if (colors) try line.appendSlice(arena, "\x1b[0m");
     try lines.append(arena, .{ .text = try line.toOwnedSlice(arena), .width = used, .source = source });
+    if (colors) try line.appendSlice(arena, active);
 }
 
 fn escapeEnd(text: []const u8, start: usize) usize {
@@ -245,11 +302,16 @@ pub fn format(arena: Allocator, value: PreviewText, width: usize, wrap: bool, co
     var source: usize = 1;
     var focus_row: ?usize = null;
     var clipped = false;
+    // The SGR sequences since the last reset: what the next line reopens with.
+    var active: std.ArrayList(u8) = .empty;
+    defer active.deinit(arena);
+    // The line a final reopen started is never finished.
+    defer line.deinit(arena);
     var i: usize = 0;
     while (i < value.text.len) {
         const byte = value.text[i];
         if (byte == '\n') {
-            try finishLine(arena, &lines, &line, used, colors, source, value.focus_line, &focus_row);
+            try finishLine(arena, &lines, &line, used, colors, source, value.focus_line, &focus_row, active.items);
             used = 0;
             clipped = false;
             source += 1;
@@ -258,7 +320,14 @@ pub fn format(arena: Allocator, value: PreviewText, width: usize, wrap: bool, co
         }
         if (byte == 0x1b) {
             const end = escapeEnd(value.text, i);
-            if (!clipped and colors and isSgr(value.text[i..end])) try line.appendSlice(arena, value.text[i..end]);
+            const sequence = value.text[i..end];
+            if (colors and isSgr(sequence)) {
+                if (!clipped) try line.appendSlice(arena, sequence);
+                const params = sequence[2 .. sequence.len - 1];
+                const reset = params.len == 0 or std.mem.eql(u8, params, "0");
+                if (reset or std.mem.startsWith(u8, params, "0;")) active.clearRetainingCapacity();
+                if (!reset) try active.appendSlice(arena, sequence);
+            }
             i = end;
             continue;
         }
@@ -270,7 +339,7 @@ pub fn format(arena: Allocator, value: PreviewText, width: usize, wrap: bool, co
             const spaces = 4 - used % 4;
             for (0..spaces) |_| {
                 if (!clipped and wrap and width > 0 and used == width) {
-                    try finishLine(arena, &lines, &line, used, colors, source, value.focus_line, &focus_row);
+                    try finishLine(arena, &lines, &line, used, colors, source, value.focus_line, &focus_row, active.items);
                     used = 0;
                 }
                 if (!clipped and used < width) {
@@ -288,7 +357,7 @@ pub fn format(arena: Allocator, value: PreviewText, width: usize, wrap: bool, co
         const decoded = std.unicode.utf8Decode(value.text[i..end]) catch null;
         const count = if (decoded) |cp| columns(cp) else 1;
         if (!clipped and wrap and width > 0 and used > 0 and used + count > width) {
-            try finishLine(arena, &lines, &line, used, colors, source, value.focus_line, &focus_row);
+            try finishLine(arena, &lines, &line, used, colors, source, value.focus_line, &focus_row, active.items);
             used = 0;
         }
         if (!clipped and width > 0 and used + count <= width) {
@@ -300,7 +369,7 @@ pub fn format(arena: Allocator, value: PreviewText, width: usize, wrap: bool, co
         i = if (decoded != null) end else i + 1;
     }
     if (value.text.len == 0 or value.text[value.text.len - 1] != '\n') {
-        try finishLine(arena, &lines, &line, used, colors, source, value.focus_line, &focus_row);
+        try finishLine(arena, &lines, &line, used, colors, source, value.focus_line, &focus_row, active.items);
     }
     return .{ .lines = try lines.toOwnedSlice(arena), .focus_row = focus_row };
 }
@@ -480,7 +549,7 @@ fn commandRun(ctx: *anyopaque, arena: Allocator, row: []const u8) !PreviewText {
         }
         lifecycle.waitExit(&child, 5);
     }
-    return .{ .text = "(preview timed out)" };
+    return .{ .text = timed_out };
 }
 
 fn emptyPreview(_: *anyopaque, _: Allocator, _: []const u8) anyerror!PreviewText {
@@ -648,4 +717,36 @@ test "a published preview signals the wake event the frame loop waits on" {
     try worker.post(1, "row");
     try std.testing.expectEqual(@as(u32, 0), WaitForSingleObject(worker.wake.?, 2000));
     try std.testing.expect(worker.take(1) != null);
+}
+
+var counted_calls: usize = 0;
+
+fn countingPreview(_: *anyopaque, arena: Allocator, row: []const u8) anyerror!PreviewText {
+    counted_calls += 1;
+    return .{ .text = try arena.dupe(u8, row) };
+}
+
+test "a cached preview is shown again without running the previewer" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    counted_calls = 0;
+    var dummy: u8 = 0;
+    var worker = Worker.init(.{ .ctx = &dummy, .func = countingPreview });
+    worker.cache_limit = 4;
+    try worker.start();
+    defer worker.deinit();
+    for ([_][]const u8{ "a", "b", "a" }, 1..) |row, id| {
+        try worker.post(id, row);
+        try std.testing.expectEqual(@as(u32, 0), WaitForSingleObject(worker.wake.?, 2000));
+        try std.testing.expectEqualStrings(row, worker.take(id).?.text);
+    }
+    try std.testing.expectEqual(@as(usize, 2), counted_calls);
+}
+
+test "a color that crosses a wrap is reopened on the next visual line" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const content = try format(a, .{ .text = "\x1b[31mabcdef\x1b[0m" }, 3, true, true);
+    try std.testing.expectEqual(@as(usize, 2), content.lines.len);
+    try std.testing.expect(std.mem.startsWith(u8, content.lines[1].text, "\x1b[31mdef"));
 }
