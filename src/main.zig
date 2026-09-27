@@ -191,18 +191,7 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
         opts.preview = pick.commandPreviewer(&command_preview);
     }
     var file_rows: FileRows = .{ .rows = &.{} };
-    if (file) |path| {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
-        var rows: std.ArrayList([]const u8) = .empty;
-        if (bytes.len != 0) {
-            var lines = std.mem.splitScalar(u8, bytes, '\n');
-            while (lines.next()) |line| {
-                if (lines.index == null and line.len == 0 and bytes[bytes.len - 1] == '\n') break;
-                try rows.append(arena, std.mem.trimEnd(u8, line, "\r"));
-            }
-        }
-        file_rows.rows = rows.items;
-    }
+    if (file) |path| file_rows.rows = try splitRows(arena, try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited));
     const feed: stream.Feed = .{
         .source = if (command) |argv|
             .{ .command = .{ .argv = argv } }
@@ -216,7 +205,16 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
     // fzf's --filter: rank without a UI, so the matcher can be compared
     // against fzf on the same input, for speed and for ranking.
     if (filter) |text| {
-        const rows = try stream.collect(arena, io, feed);
+        // Nothing is shown until the end, so streaming buys nothing here, and
+        // copying each row as it arrives costs two allocations per row: read
+        // a file or a redirected file whole. A command or a pipe still goes
+        // through the stream reader, which knows how to drain a Windows pipe.
+        const rows = if (file != null)
+            file_rows.rows
+        else if (command == null and !stdinIsPipe())
+            try splitRows(arena, try readStdin(arena, io))
+        else
+            try stream.collect(arena, io, feed);
         if (rows.len == 0) return 1;
         const query = try fuzzy.parseQuery(arena, text, .smart);
         const visible = try arena.alloc([]const u8, rows.len);
@@ -242,4 +240,28 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
         .no_console => return 2,
         .empty => return 1,
     }
+}
+
+fn readStdin(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io, &buffer);
+    return reader.interface.allocRemaining(arena, .unlimited);
+}
+
+fn splitRows(arena: std.mem.Allocator, bytes: []const u8) ![]const []const u8 {
+    var rows: std.ArrayList([]const u8) = .empty;
+    if (bytes.len == 0) return rows.items;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (lines.index == null and line.len == 0 and bytes[bytes.len - 1] == '\n') break;
+        try rows.append(arena, std.mem.trimEnd(u8, line, "\r"));
+    }
+    return rows.items;
+}
+
+extern "kernel32" fn GetFileType(handle: *anyopaque) callconv(.winapi) u32;
+
+fn stdinIsPipe() bool {
+    if (@import("builtin").os.tag != .windows) return true;
+    return GetFileType(std.Io.File.stdin().handle) == 3;
 }
