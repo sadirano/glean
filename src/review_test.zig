@@ -90,3 +90,19 @@ test "moving the cursor keeps the old preview where it was until the new one arr
     state.setPreview(.{ .text = "one\ntwo", .focus_line = 2 });
     try std.testing.expect(state.preview_focus_pending);
 }
+
+test "header lines line up with the rows under them" {
+    const a = std.testing.allocator;
+    var state = try pick.State.init(a, &.{ "NAME", "alpha" }, .{ .header_lines = 1 });
+    defer state.deinit();
+    const frame = try pick.render(&state, .{}, 20, 5, false, false, a);
+    defer a.free(frame);
+    var lines = std.mem.splitSequence(u8, frame, "\r\n");
+    var header_col: ?usize = null;
+    var row_col: ?usize = null;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "NAME")) |col| header_col = col;
+        if (std.mem.indexOf(u8, line, "alpha")) |col| row_col = col;
+    }
+    try std.testing.expectEqual(row_col.?, header_col.?);
+}

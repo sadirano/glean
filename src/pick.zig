@@ -657,7 +657,10 @@ pub fn render(state: *State, theme: Theme, width: usize, height: usize, colors: 
             const header = line - (list_start + list_height);
             try style(&out, arena, colors, theme.header, theme.bg);
             const text = fuzzy.visiblePart(state.rows[header], state.opts.delimiter, state.opts.with_nth_from);
-            const used = try plainWidth(&out, arena, text, width);
+            // Indented by the rows' gutter, so a header names the columns below it.
+            const gutter = @min(width, @as(usize, 3));
+            try pad(&out, arena, 0, gutter);
+            const used = gutter + try plainWidth(&out, arena, text, width - gutter);
             try pad(&out, arena, used, width);
         } else if (height >= 2 and line == height - 2) {
             try style(&out, arena, colors, theme.info, theme.bg);
