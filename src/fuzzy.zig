@@ -4,16 +4,18 @@
 //! constants follow fzf by Junegunn Choi (MIT); see NOTICE for attribution.
 
 const std = @import("std");
+const fold = @import("fold.zig");
+const score = @import("score.zig");
+
+const readRune = fold.readRune;
+const foldAccent = fold.foldAccent;
+const normalize = fold.normalize;
+const v1Match = score.v1Match;
 
 pub const Case = enum { smart, respect, ignore };
 
-pub const TermKind = enum { fuzzy, exact, prefix, suffix, equal };
-pub const Term = struct {
-    text: []const u8,
-    kind: TermKind,
-    inverse: bool,
-    case_sensitive: bool,
-};
+pub const TermKind = score.TermKind;
+pub const Term = score.Term;
 
 /// AND of groups; a group is an OR of terms.
 pub const Query = struct { groups: []const []const Term };
@@ -84,479 +86,71 @@ fn parseTerm(arena: std.mem.Allocator, raw: []const u8, case: Case) !Term {
         }
     }
     var folded: std.ArrayList(u8) = .empty;
+    var runes: std.ArrayList(u21) = .empty;
+    var ascii = true;
     var scan: usize = 0;
     while (scan < part.len) {
         const rune = readRune(part, scan);
         const value = normalize(rune.value, sensitive);
+        try runes.append(arena, value);
+        if (value >= 0x80) ascii = false;
         var bytes: [4]u8 = undefined;
         const length = try std.unicode.utf8Encode(value, &bytes);
         try folded.appendSlice(arena, bytes[0..length]);
         scan = rune.end;
     }
-    return .{ .text = try folded.toOwnedSlice(arena), .kind = kind, .inverse = inverse, .case_sensitive = sensitive };
-}
-
-const Rune = struct { value: u21, start: usize, end: usize };
-
-fn readRune(bytes: []const u8, start: usize) Rune {
-    const length: usize = std.unicode.utf8ByteSequenceLength(bytes[start]) catch 1;
-    const end = @min(start + length, bytes.len);
-    const value = std.unicode.utf8Decode(bytes[start..end]) catch @as(u21, bytes[start]);
-    return .{ .value = value, .start = start, .end = if (value == bytes[start] and length != 1) start + 1 else end };
-}
-
-fn previousRune(bytes: []const u8, end: usize) Rune {
-    var start = end - 1;
-    while (start > 0 and bytes[start] & 0xc0 == 0x80) : (start -= 1) {}
-    const rune = readRune(bytes, start);
-    if (rune.end == end) return rune;
-    return .{ .value = bytes[end - 1], .start = end - 1, .end = end };
-}
-
-// The table keeps fzf's single-rune folds, including irregular letters.
-const fold_00c0 = "AAAAAA.CEEEEIIII" ++
-    ".NOOOOO.OUUUUY.s" ++
-    "aaaaaa.ceeeeiiii" ++
-    ".nooooo.ouuuuy.y" ++
-    "aaaaaaccccccccdd" ++
-    "ddeeeeeeeeeegggg" ++
-    "gggghhhhiiiiiiii" ++
-    "Ii..jjkk.lllllll" ++
-    "lllnnnnnn...oooo" ++
-    "oo..rrrrrrssssss" ++
-    "ssttttttuuuuuuuu" ++
-    "uuuuwwyyYzzzzzzs" ++
-    "bBbb..OccDDdd.E." ++
-    "EffG...Ikkl.MNnO" ++
-    "oo..pp.....tttTu" ++
-    "u.Vyyzz........." ++
-    ".............aai" ++
-    "ioouu........e.." ++
-    "....ggggkkoo...." ++
-    "j...gg..nn......" ++
-    "aaaaeeeeiiiioooo" ++
-    "rrrruuuusstt..hh" ++
-    "Nd..zzaaee....oo" ++
-    "..yylntj...CcL.s" ++
-    "z..BUVEeJjQqRrYy" ++
-    "aa.bocdde..eeeej" ++
-    "gg...hh.i..lll.m" ++
-    "mmnn.o...rrrrrrr" ++
-    "..s....ttu.vvwy." ++
-    "zz.....c..e..jk." ++
-    "q.............h.";
-const fold_1d00 = "........ei......" ++
-    ".ooo..oo.....uum" ++
-    "................" ++
-    "................" ++
-    "................" ++
-    "................" ++
-    "..iruv.........." ++
-    "................";
-const fold_1e00 = "aabbbbbb..dddddd" ++
-    "dddd....eeee..ff" ++
-    "gghhhhhhhhhhii.." ++
-    "kkkkkkll..llllmm" ++
-    "mmmmnnnnnnnn...." ++
-    "....pppprrrr..rr" ++
-    "ssss......tttttt" ++
-    "ttuuuuuu....vvvv" ++
-    "wwwwwwwwwwxxxxyy" ++
-    "zzzzzzhtwyas..s." ++
-    "aaaaAaAaAaAaAaAa" ++
-    "AaAaAaAaeeeeeeEe" ++
-    "EeEeEeEeiiiioooo" ++
-    "OoOoOoOoOoOoOoOo" ++
-    "OoOouuuuUuUuUuUu" ++
-    "Uuyyyyyyyy......";
-const fold_2070 = ".i.............." ++
-    "................" ++
-    ".....hklmnpst...";
-const fold_2100 = "................" ++
-    "................" ++
-    "..........ka...." ++
-    "................" ++
-    "................" ++
-    "................" ++
-    "................" ++
-    "................" ++
-    "...cc...........";
-const fold_2c60 = "..l.r........ama" ++
-    "..............sz";
-const fold_a720 = "................" ++
-    "................" ++
-    "................" ++
-    "................" ++
-    "................" ++
-    "................" ++
-    ".............h.." ++
-    "................" ++
-    "..........hegl.." ++
-    "ktj............." ++
-    ".....s.........." ++
-    "................" ++
-    "................" ++
-    "................";
-const fold_ff00 = "................" ++
-    "................" ++
-    ".ABCDEFGHIJKLMNO" ++
-    "PQRSTUVWXYZ....." ++
-    ".abcdefghijklmno" ++
-    "pqrstuvwxyz.....";
-
-fn foldAccent(cp: u21) u21 {
-    const mapped: u8 = switch (cp) {
-        0x00c0...0x02af => fold_00c0[@intCast(cp - 0x00c0)],
-        0x1d00...0x1d7f => fold_1d00[@intCast(cp - 0x1d00)],
-        0x1e00...0x1eff => fold_1e00[@intCast(cp - 0x1e00)],
-        0x2070...0x209f => fold_2070[@intCast(cp - 0x2070)],
-        0x2100...0x218f => fold_2100[@intCast(cp - 0x2100)],
-        0x2c60...0x2c7f => fold_2c60[@intCast(cp - 0x2c60)],
-        0xa720...0xa7ff => fold_a720[@intCast(cp - 0xa720)],
-        0xff00...0xff5f => fold_ff00[@intCast(cp - 0xff00)],
-        else => return cp,
-    };
-    return if (mapped == '.') cp else mapped;
-}
-fn normalize(cp: u21, sensitive: bool) u21 {
-    const base = foldAccent(cp);
-    return if (!sensitive and base >= 'A' and base <= 'Z') base + ('a' - 'A') else base;
-}
-
-fn same(query_char: u21, row_char: u21, sensitive: bool) bool {
-    return query_char == normalize(row_char, sensitive);
-}
-
-const CharClass = enum { white, nonword, delimiter, lower, upper, letter, number };
-
-fn charClass(cp: u21) CharClass {
-    const value = foldAccent(cp);
-    if (value == ' ' or (value >= 9 and value <= 13) or value == 0xa0) return .white;
-    if (value == '/' or value == ',' or value == ':' or value == ';' or value == '|') return .delimiter;
-    if (value >= 'a' and value <= 'z') return .lower;
-    if (value >= 'A' and value <= 'Z') return .upper;
-    if (value >= '0' and value <= '9') return .number;
-    if (value >= 0x80) return .letter;
-    return .nonword;
-}
-
-fn bonus(prev: CharClass, current: CharClass) i32 {
-    if (current == .white) return 10;
-    if (current == .nonword or current == .delimiter) return 8;
-    if (prev == .white) return 10;
-    if (prev == .delimiter) return 9;
-    if (prev == .nonword) return 8;
-    if ((prev == .lower and current == .upper) or (prev != .number and current == .number)) return 7;
-    return 0;
-}
-
-fn bonusAt(row: []const u8, pos: usize) i32 {
-    const prev: CharClass = if (pos == 0) .white else charClass(previousRune(row, pos).value);
-    return bonus(prev, charClass(readRune(row, pos).value));
-}
-
-fn clampedScore(value: i64) i32 {
-    return @intCast(std.math.clamp(value, std.math.minInt(i32), std.math.maxInt(i32)));
-}
-
-const MatchChar = struct { value: u21, start: usize, end: usize, bonus: i32 };
-
-fn appendSpan(list: *std.ArrayList(usize), arena: std.mem.Allocator, start: usize, end: usize) !void {
-    for (start..end) |offset| try list.append(arena, offset);
-}
-
-fn v1Match(term: Term, row: []const u8, end: usize, positions: ?*std.ArrayList(usize), arena: std.mem.Allocator) !i32 {
-    var chars: std.ArrayList(MatchChar) = .empty;
-    defer chars.deinit(arena);
-    var qend = term.text.len;
-    var rend = end;
-    while (qend != 0) {
-        const rune = previousRune(row, rend);
-        rend = rune.start;
-        const q = previousRune(term.text, qend);
-        if (!same(q.value, rune.value, term.case_sensitive)) continue;
-        try chars.append(arena, .{ .value = rune.value, .start = rune.start, .end = rune.end, .bonus = bonusAt(row, rune.start) });
-        qend = q.start;
-    }
-    std.mem.reverse(MatchChar, chars.items);
-    var score: i64 = 0;
-    var run_bonus: i32 = 0;
-    for (chars.items, 0..) |ch, index| {
-        var match_bonus = ch.bonus;
-        if (index == 0) {
-            score += 16 + @as(i64, match_bonus) * 2;
-        } else {
-            const prev = chars.items[index - 1];
-            if (prev.end == ch.start) {
-                run_bonus = @max(run_bonus, match_bonus);
-                match_bonus = @max(run_bonus, 4);
-            } else {
-                var gap: i64 = 0;
-                var cursor = prev.end;
-                while (cursor < ch.start) : (gap += 1) cursor = readRune(row, cursor).end;
-                score -= 3 + gap - 1;
-                run_bonus = match_bonus;
-            }
-            score += 16 + match_bonus;
-        }
-        if (index == 0) run_bonus = ch.bonus;
-        if (positions) |list| try appendSpan(list, arena, ch.start, ch.end);
-    }
-    return clampedScore(score);
-}
-
-// A bounded matrix keeps ranking scratch space independent of the row count.
-const max_window = 512;
-const max_query = 256;
-const max_cells = 8192;
-const minus_inf = -1_000_000_000;
-
-fn v2Match(term: Term, row: []const u8, start: usize, end: usize, positions: ?*std.ArrayList(usize), arena: std.mem.Allocator) !?i32 {
-    var query_chars: [max_query]u21 = undefined;
-    var qlen: usize = 0;
-    var qpos: usize = 0;
-    while (qpos < term.text.len) {
-        if (qlen == max_query) return null;
-        const rune = readRune(term.text, qpos);
-        query_chars[qlen] = rune.value;
-        qlen += 1;
-        qpos = rune.end;
-    }
-    var window: [max_window]MatchChar = undefined;
-    var wlen: usize = 0;
-    var rpos = start;
-    var prev_class: CharClass = if (start == 0) .white else charClass(previousRune(row, start).value);
-    while (rpos < end) {
-        if (wlen == max_window) return null;
-        const rune = readRune(row, rpos);
-        const current_class = charClass(rune.value);
-        window[wlen] = .{ .value = rune.value, .start = rune.start, .end = rune.end, .bonus = bonus(prev_class, current_class) };
-        wlen += 1;
-        prev_class = current_class;
-        rpos = rune.end;
-    }
-    if (qlen * wlen > max_cells) return null;
-
-    var prev_match: [max_window]i32 = undefined;
-    var prev_gap: [max_window]i32 = undefined;
-    var prev_run: [max_window]i32 = undefined;
-    var curr_match: [max_window]i32 = undefined;
-    var curr_gap: [max_window]i32 = undefined;
-    var curr_run: [max_window]i32 = undefined;
-    var match_from: [max_cells]u8 = undefined;
-    var gap_from: [max_cells]u8 = undefined;
-
-    for (0..qlen) |qi| {
-        for (0..wlen) |wi| {
-            const cell = qi * wlen + wi;
-            curr_match[wi] = minus_inf;
-            curr_run[wi] = 0;
-            if (positions != null) match_from[cell] = 0;
-            if (same(query_chars[qi], window[wi].value, term.case_sensitive)) {
-                if (qi == 0) {
-                    curr_match[wi] = 16 + 2 * window[wi].bonus;
-                    curr_run[wi] = window[wi].bonus;
-                } else if (wi > 0) {
-                    if (prev_match[wi - 1] != minus_inf) {
-                        const run = @max(prev_run[wi - 1], window[wi].bonus);
-                        curr_match[wi] = prev_match[wi - 1] + 16 + @max(run, 4);
-                        curr_run[wi] = run;
-                        if (positions != null) match_from[cell] = 1;
-                    }
-                    if (prev_gap[wi - 1] != minus_inf) {
-                        const separated = prev_gap[wi - 1] + 16 + window[wi].bonus;
-                        if (separated > curr_match[wi]) {
-                            curr_match[wi] = separated;
-                            curr_run[wi] = window[wi].bonus;
-                            if (positions != null) match_from[cell] = 2;
-                        }
-                    }
-                }
-            }
-            curr_gap[wi] = minus_inf;
-            if (positions != null) gap_from[cell] = 0;
-            if (wi > 0) {
-                if (curr_match[wi - 1] != minus_inf) {
-                    curr_gap[wi] = curr_match[wi - 1] - 3;
-                    if (positions != null) gap_from[cell] = 1;
-                }
-                if (curr_gap[wi - 1] != minus_inf and curr_gap[wi - 1] - 1 > curr_gap[wi]) {
-                    curr_gap[wi] = curr_gap[wi - 1] - 1;
-                    if (positions != null) gap_from[cell] = 2;
-                }
-            }
-        }
-        @memcpy(prev_match[0..wlen], curr_match[0..wlen]);
-        @memcpy(prev_gap[0..wlen], curr_gap[0..wlen]);
-        @memcpy(prev_run[0..wlen], curr_run[0..wlen]);
-    }
-    var best_score: i32 = minus_inf;
-    var best_end: usize = 0;
-    for (prev_match[0..wlen], 0..) |score, wi| {
-        if (score > best_score) {
-            best_score = score;
-            best_end = wi;
-        }
-    }
-    if (best_score == minus_inf) return null;
-    if (positions) |list| {
-        const old_len = list.items.len;
-        var qi = qlen - 1;
-        var wi = best_end;
-        var state: u8 = 1;
-        while (true) {
-            const cell = qi * wlen + wi;
-            if (state == 1) {
-                try appendSpan(list, arena, window[wi].start, window[wi].end);
-                if (qi == 0) break;
-                state = match_from[cell];
-                qi -= 1;
-            } else {
-                state = gap_from[cell];
-            }
-            wi -= 1;
-        }
-        std.mem.reverse(usize, list.items[old_len..]);
-    }
-    return best_score;
-}
-
-fn fuzzyMatch(term: Term, row: []const u8, positions: ?*std.ArrayList(usize), arena: std.mem.Allocator) !?i32 {
-    if (term.text.len > row.len) return null;
-    var qpos: usize = 0;
-    var rpos: usize = 0;
-    var first: usize = 0;
-    var end: usize = 0;
-    while (rpos < row.len) {
-        const rune = readRune(row, rpos);
-        if (same(readRune(term.text, qpos).value, rune.value, term.case_sensitive)) {
-            if (qpos == 0) first = rune.start;
-            qpos = readRune(term.text, qpos).end;
-            if (qpos == term.text.len) {
-                end = rune.end;
-                break;
-            }
-        }
-        rpos = rune.end;
-    }
-    if (end == 0) return null;
-    var last_end = end;
-    const last_query = previousRune(term.text, term.text.len).value;
-    rpos = end;
-    while (rpos < row.len) {
-        const rune = readRune(row, rpos);
-        if (same(last_query, rune.value, term.case_sensitive)) last_end = rune.end;
-        rpos = rune.end;
-    }
-    if (try v2Match(term, row, first, last_end, positions, arena)) |score| return score;
-    return try v1Match(term, row, end, positions, arena);
-}
-
-fn exactAt(term: Term, row: []const u8, start: usize) ?usize {
-    var qpos: usize = 0;
-    var rpos = start;
-    while (qpos < term.text.len) {
-        if (rpos == row.len) return null;
-        const q = readRune(term.text, qpos);
-        const r = readRune(row, rpos);
-        if (!same(q.value, r.value, term.case_sensitive)) return null;
-        qpos = q.end;
-        rpos = r.end;
-    }
-    return rpos;
-}
-
-fn exactMatch(term: Term, row: []const u8, positions: ?*std.ArrayList(usize), arena: std.mem.Allocator) !?i32 {
-    var best_start: ?usize = null;
-    var best_end: usize = 0;
-    var best_bonus: i32 = -1;
-    var start: usize = 0;
-    while (start < row.len) : (start = readRune(row, start).end) {
-        const end = exactAt(term, row, start) orelse continue;
-        const allowed = switch (term.kind) {
-            .exact => true,
-            .prefix => start == 0,
-            .suffix => end == row.len,
-            .equal => start == 0 and end == row.len,
-            .fuzzy => unreachable,
-        };
-        if (!allowed) continue;
-        const score_bonus = bonusAt(row, start);
-        if (score_bonus > best_bonus) {
-            best_start = start;
-            best_end = end;
-            best_bonus = score_bonus;
-            if (score_bonus == 10) break;
-        }
-    }
-    const found = best_start orelse return null;
-    if (positions) |list| try appendSpan(list, arena, found, best_end);
-    var length: i64 = 0;
-    var qpos: usize = 0;
-    while (qpos < term.text.len) : (length += 1) qpos = readRune(term.text, qpos).end;
-    return clampedScore(length * 16 + best_bonus);
-}
-
-fn positiveMatch(term: Term, row: []const u8, positions: ?*std.ArrayList(usize), arena: std.mem.Allocator) !?i32 {
-    return switch (term.kind) {
-        .fuzzy => fuzzyMatch(term, row, positions, arena),
-        else => exactMatch(term, row, positions, arena),
+    return .{
+        .text = try folded.toOwnedSlice(arena),
+        .kind = kind,
+        .inverse = inverse,
+        .case_sensitive = sensitive,
+        .folded = try runes.toOwnedSlice(arena),
+        .ascii = ascii,
     };
 }
 
-/// null means no match. Higher scores rank first. Positions are byte offsets.
 pub fn matchRow(query: Query, row: []const u8, positions: ?*std.ArrayList(usize), arena: std.mem.Allocator) !?i32 {
-    if (positions) |list| list.clearRetainingCapacity();
-    var total: i64 = 0;
-    for (query.groups) |group| {
-        var best_score: ?i32 = null;
-        var best_term: ?Term = null;
-        for (group) |term| {
-            const positive = try positiveMatch(term, row, null, arena);
-            const score: ?i32 = if (term.inverse)
-                (if (positive == null) @as(i32, 0) else null)
-            else
-                positive;
-            if (score) |value| {
-                if (best_score == null or value > best_score.?) {
-                    best_score = value;
-                    best_term = term;
-                }
-            }
-        }
-        const value = best_score orelse {
-            if (positions) |list| list.clearRetainingCapacity();
-            return null;
-        };
-        total += value;
-        if (positions) |list| {
-            const term = best_term.?;
-            if (!term.inverse) _ = try positiveMatch(term, row, list, arena);
-        }
-    }
-    if (positions) |list| {
-        std.sort.pdq(usize, list.items, {}, std.sort.asc(usize));
-        var out: usize = 0;
-        for (list.items) |pos| {
-            if (out != 0 and list.items[out - 1] == pos) continue;
-            list.items[out] = pos;
-            out += 1;
-        }
-        list.items.len = out;
-    }
-    return clampedScore(total);
+    const scratch = try arena.create(score.Scratch);
+    defer arena.destroy(scratch);
+    scratch.* = .{};
+    const backtrack = if (positions != null) try arena.create(score.Backtrack) else null;
+    defer if (backtrack) |table| arena.destroy(table);
+    scratch.backtrack = backtrack;
+    return score.matchRow(query, row, positions, arena, scratch);
 }
 
 pub const Hit = struct { index: u32, score: i32 };
 
-/// Filter and rank; an empty query preserves input order.
-pub fn rank(arena: std.mem.Allocator, query: Query, rows: []const []const u8) ![]Hit {
-    var hits: std.ArrayList(Hit) = .empty;
-    for (rows, 0..) |row, index| {
-        const score = try matchRow(query, row, null, arena) orelse continue;
-        try hits.append(arena, .{ .index = std.math.cast(u32, index) orelse return error.TooManyRows, .score = score });
+const RankWorker = struct {
+    query: Query,
+    rows: []const []const u8,
+    first: usize,
+    local_arena: std.heap.ArenaAllocator,
+    hits: std.ArrayList(Hit) = .empty,
+    failure: ?anyerror = null,
+
+    fn run(self: *RankWorker) void {
+        self.process() catch |err| {
+            self.failure = err;
+        };
     }
-    if (query.groups.len != 0) std.sort.pdq(Hit, hits.items, rows, struct {
+
+    fn process(self: *RankWorker) !void {
+        const allocator = self.local_arena.allocator();
+        const scratch = try allocator.create(score.Scratch);
+        scratch.* = .{};
+        for (self.rows, 0..) |row, offset| {
+            const value = try score.matchRow(self.query, row, null, allocator, scratch) orelse continue;
+            try self.hits.append(allocator, .{
+                .index = std.math.cast(u32, self.first + offset) orelse return error.TooManyRows,
+                .score = value,
+            });
+        }
+    }
+};
+
+fn sortHits(hits: []Hit, rows: []const []const u8) void {
+    std.sort.pdq(Hit, hits, rows, struct {
         fn less(all_rows: []const []const u8, a: Hit, b: Hit) bool {
             if (a.score != b.score) return a.score > b.score;
             const a_len = all_rows[a.index].len;
@@ -565,7 +159,76 @@ pub fn rank(arena: std.mem.Allocator, query: Query, rows: []const []const u8) ![
             return a.index < b.index;
         }
     }.less);
-    return hits.toOwnedSlice(arena);
+}
+
+/// Filter and rank; an empty query preserves input order.
+pub fn rank(arena: std.mem.Allocator, query: Query, rows: []const []const u8) ![]Hit {
+    if (query.groups.len == 0) {
+        const result = try arena.alloc(Hit, rows.len);
+        for (result, 0..) |*hit, index| hit.* = .{
+            .index = std.math.cast(u32, index) orelse return error.TooManyRows,
+            .score = 0,
+        };
+        return result;
+    }
+
+    const worker_count = @min(std.Thread.getCpuCount() catch 1, @max(@as(usize, 1), rows.len / 20_000));
+    if (worker_count == 1) {
+        const scratch = try arena.create(score.Scratch);
+        defer arena.destroy(scratch);
+        scratch.* = .{};
+        var hits: std.ArrayList(Hit) = .empty;
+        for (rows, 0..) |row, index| {
+            const value = try score.matchRow(query, row, null, arena, scratch) orelse continue;
+            try hits.append(arena, .{
+                .index = std.math.cast(u32, index) orelse return error.TooManyRows,
+                .score = value,
+            });
+        }
+        sortHits(hits.items, rows);
+        return hits.toOwnedSlice(arena);
+    }
+
+    const workers = try arena.alloc(RankWorker, worker_count);
+    var initialized: usize = 0;
+    defer for (workers[0..initialized]) |*worker| worker.local_arena.deinit();
+    const chunk = (rows.len + worker_count - 1) / worker_count;
+    for (workers, 0..) |*worker, index| {
+        const first = index * chunk;
+        worker.* = .{
+            .query = query,
+            .rows = rows[first..@min(first + chunk, rows.len)],
+            .first = first,
+            .local_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        };
+        initialized += 1;
+    }
+    const threads = try arena.alloc(std.Thread, worker_count - 1);
+    var started: usize = 0;
+    for (workers[1..]) |*worker| {
+        threads[started] = std.Thread.spawn(.{}, RankWorker.run, .{worker}) catch {
+            worker.run();
+            continue;
+        };
+        started += 1;
+    }
+    workers[0].run();
+    for (threads[0..started]) |thread| thread.join();
+
+    var total: usize = 0;
+    for (workers) |worker| {
+        if (worker.failure) |err| return err;
+        total += worker.hits.items.len;
+    }
+    const result = try arena.alloc(Hit, total);
+    var cursor: usize = 0;
+    for (workers) |worker| {
+        const source = worker.hits.items;
+        @memcpy(result[cursor..][0..source.len], source);
+        cursor += source.len;
+    }
+    sortHits(result, rows);
+    return result;
 }
 
 /// fzf's `--delimiter D --with-nth N..` display and search region.
@@ -673,7 +336,10 @@ test "parseQuery supports extended terms and smart case" {
 
 fn freeQuery(a: std.mem.Allocator, query: Query) void {
     for (query.groups) |group| {
-        for (group) |term| a.free(term.text);
+        for (group) |term| {
+            a.free(term.text);
+            a.free(term.folded);
+        }
         a.free(group);
     }
     a.free(query.groups);
