@@ -17,10 +17,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
-    const run_exe = b.addRunArtifact(exe);
-    if (b.args) |args| run_exe.addArgs(args);
-    const try_step = b.step("try", "Run the test harness: zig build try -- <file> [options]");
-    try_step.dependOn(&run_exe.step);
 
     const tests = b.addTest(.{ .root_module = module });
     const run_tests = b.addRunArtifact(tests);
