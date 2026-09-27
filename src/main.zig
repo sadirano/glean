@@ -176,18 +176,11 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
 
     opts.colors = init.minimal.environ.getAlloc(arena, "FZF_DEFAULT_OPTS") catch null;
     var text_context: TextContext = .{ .io = io };
-    var preview_argv: [4][]const u8 = undefined;
     var command_preview: pick.CommandPreview = undefined;
     if (preview_text) {
         opts.preview = .{ .ctx = &text_context, .func = showText };
     } else if (preview_line) |line| {
-        if (builtin.os.tag == .windows) {
-            preview_argv = .{ "cmd.exe", "/d", "/c", line };
-            command_preview = .{ .io = io, .argv = preview_argv[0..4], .shell_quote = true };
-        } else {
-            preview_argv = .{ "sh", "-c", line, "" };
-            command_preview = .{ .io = io, .argv = preview_argv[0..3], .shell_quote = true };
-        }
+        command_preview = .{ .io = io, .argv = try @import("preview_template.zig").parse(arena, line) };
         opts.preview = pick.commandPreviewer(&command_preview);
     }
     var file_rows: FileRows = .{ .rows = &.{} };

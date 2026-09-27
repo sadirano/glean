@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pick = @import("pick.zig");
 const tui = @import("tui.zig");
+const lifecycle = @import("lifecycle.zig");
 
 const Allocator = std.mem.Allocator;
 // Rows are allocated one by one on the reader thread and read by the UI
@@ -32,6 +33,7 @@ fn stripCr(line: []const u8) []const u8 {
 extern "kernel32" fn GetFileType(handle: *anyopaque) callconv(.winapi) u32;
 extern "kernel32" fn PeekNamedPipe(handle: *anyopaque, buffer: ?*anyopaque, size: u32, read: ?*u32, available: ?*u32, left: ?*u32) callconv(.winapi) i32;
 extern "kernel32" fn CancelSynchronousIo(handle: *anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
 
 pub const LineFilter = struct {
@@ -41,6 +43,8 @@ pub const LineFilter = struct {
 };
 
 pub const Source = union(enum) {
+    /// Only the direct child is terminated. Descendants must not retain stdout
+    /// after it exits; glean joins the reader and cannot cancel inherited pipes.
     command: struct {
         argv: []const []const u8,
         cwd: ?[]const u8 = null,
@@ -50,6 +54,8 @@ pub const Source = union(enum) {
     stdin,
     callback: struct {
         ctx: *anyopaque,
+        /// Must return promptly when push returns false. Glean joins this callback
+        /// on shutdown; blocking work must provide its own cancellation mechanism.
         func: *const fn (ctx: *anyopaque, sink: *Sink) anyerror!void,
     },
 };
@@ -176,6 +182,7 @@ const Session = struct {
     feed: Feed,
     shared: Shared,
     child: ?std.process.Child = null,
+    output: ?std.Io.File = null,
     thread: ?std.Thread = null,
     completed: bool = false,
 
@@ -193,15 +200,17 @@ const Session = struct {
                 .stdout = .pipe,
                 .stderr = if (command.quiet_stderr) .ignore else .inherit,
             });
-            errdefer {
-                if (self.child) |*child| {
-                    child.kill(self.io);
-                    if (child.stdout) |file| file.close(self.io);
-                }
-                self.child = null;
-            }
+            // Reaping closes Child's streams; the reader owns this one until join.
+            self.output = self.child.?.stdout;
+            self.child.?.stdout = null;
         }
-        self.thread = try std.Thread.spawn(.{}, readerMain, .{self});
+        errdefer {
+            if (self.child) |*child| child.kill(self.io);
+            if (self.output) |file| file.close(self.io);
+            self.output = null;
+            self.child = null;
+        }
+        self.thread = try std.Thread.spawn(.{}, readerMain, .{ self, self.output });
     }
 
     fn readRows(self: *Session, file: std.Io.File, sink: *Sink, is_stdin: bool) !bool {
@@ -213,6 +222,7 @@ const Session = struct {
             if (piped_stdin) {
                 var available: u32 = 0;
                 if (PeekNamedPipe(file.handle, null, 0, null, &available, null) == 0) {
+                    try pipeEnd(GetLastError());
                     splitter.end(sink);
                     return true;
                 }
@@ -221,11 +231,8 @@ const Session = struct {
                     continue;
                 }
             }
-            const size = file.readStreaming(self.io, &.{buffer[0..]}) catch |err| {
-                if (builtin.os.tag == .windows or err == error.EndOfStream) {
-                    splitter.end(sink);
-                    return true;
-                }
+            const size = lifecycle.readSize(file.readStreaming(self.io, &.{buffer[0..]})) catch |err| {
+                if (err == error.Canceled and self.shared.isStopped()) return false;
                 return err;
             };
             if (size == 0) {
@@ -237,10 +244,10 @@ const Session = struct {
         return false;
     }
 
-    fn readerMain(self: *Session) void {
+    fn readerMain(self: *Session, output: ?std.Io.File) void {
         var sink: Sink = .{ .shared = &self.shared };
         const eof = switch (self.feed.source) {
-            .command => self.readRows(self.child.?.stdout.?, &sink, false),
+            .command => self.readRows(output.?, &sink, false),
             .stdin => self.readRows(std.Io.File.stdin(), &sink, true),
             .callback => |callback| blk: {
                 callback.func(callback.ctx, &sink) catch |err| break :blk @as(anyerror!bool, err);
@@ -257,15 +264,10 @@ const Session = struct {
         if (self.completed) return;
         if (stop) {
             self.shared.stop();
-            const status = self.shared.status();
             if (self.child) |*child| {
-                if (status.eof and !status.capped) {
-                    _ = child.wait(self.io) catch {};
-                } else {
-                    child.kill(self.io);
-                }
+                child.kill(self.io);
             } else if (builtin.os.tag == .windows and self.feed.source == .stdin) {
-                if (self.thread) |thread| _ = CancelSynchronousIo(thread.getHandle());
+                if (self.thread) |thread| cancelReader(&self.shared, thread, interruptThread);
             }
         }
         if (self.thread) |thread| thread.join();
@@ -274,16 +276,14 @@ const Session = struct {
             const status = self.shared.status();
             if (self.child) |*child| {
                 if (status.eof and !status.capped) {
-                    _ = child.wait(self.io) catch {};
+                    lifecycle.reapBounded(child, self.io, 200);
                 } else {
                     child.kill(self.io);
                 }
             }
         }
-        if (self.child) |*child| {
-            if (child.stdout) |file| file.close(self.io);
-            child.stdout = null;
-        }
+        if (self.output) |file| file.close(self.io);
+        self.output = null;
         self.completed = true;
     }
 
@@ -292,6 +292,35 @@ const Session = struct {
         self.shared.deinit();
     }
 };
+
+fn finishRows(shared: *Shared, state: *pick.State, displayed: usize) !void {
+    // Done is published after the last append, so this snapshot is final.
+    const final = try shared.snapshot(reader_allocator, displayed);
+    defer reader_allocator.free(final);
+    if (final.len != 0) try state.appendRows(final);
+    try state.refreshRows();
+}
+
+fn cancelReader(shared: *Shared, context: anytype, comptime cancel: fn (@TypeOf(context)) void) void {
+    // Keep cancelling until the reader acknowledges exit: it may enter read
+    // after the first cancellation found no pending synchronous operation.
+    while (!shared.status().done) {
+        cancel(context);
+        lifecycle.sleepMs(1);
+    }
+}
+
+fn pipeEnd(code: u32) !void {
+    switch (code) {
+        109, 233 => return,
+        5 => return error.AccessDenied,
+        else => return error.InputOutput,
+    }
+}
+
+fn interruptThread(thread: std.Thread) void {
+    _ = CancelSynchronousIo(thread.getHandle());
+}
 
 pub fn collect(arena: Allocator, io: std.Io, feed: Feed) ![]const []const u8 {
     var session = Session.init(io, feed);
@@ -362,7 +391,7 @@ pub fn pickFeed(arena: Allocator, io: std.Io, feed: Feed, opts: pick.Options) !F
         if (status.failure) |err| return err;
         if (status.done) {
             session.complete(false);
-            if (pending_rows) try state.refreshRows();
+            try finishRows(&session.shared, &state, displayed);
             if (state.rows.len == 0) return .empty;
             running = false;
             draw = true;
@@ -520,4 +549,65 @@ test "Windows command collection and early cap" {
     try std.testing.expectEqualStrings("row3000", all[2999]);
     const capped = try collect(arena_state.allocator(), std.testing.io, .{ .source = source, .max_rows = 100 });
     try std.testing.expectEqual(@as(usize, 100), capped.len);
+}
+
+test "done handling consumes rows published after the earlier snapshot" {
+    var shared: Shared = .{ .filter = null, .max_rows = 0 };
+    defer shared.deinit();
+    var sink: Sink = .{ .shared = &shared };
+    try std.testing.expect(sink.push("first"));
+    const early = try shared.snapshot(std.testing.allocator, 0);
+    defer std.testing.allocator.free(early);
+    var state = try pick.State.init(std.testing.allocator, early, .{});
+    defer state.deinit();
+    try std.testing.expect(sink.push("final"));
+    shared.finish(true, null);
+    try std.testing.expect(shared.status().done);
+    try finishRows(&shared, &state, early.len);
+    try std.testing.expectEqual(@as(usize, 2), state.rows.len);
+    try std.testing.expectEqualStrings("final", state.rows[1]);
+}
+
+test "EOF collection with a cap bounds process reaping" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const source: Source = .{ .command = .{ .argv = &.{ "python", "-c", "import os,time;os.write(1,b'row\\n');os.close(1);time.sleep(2)" } } };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]usize{ 1, 2 }) |cap| {
+        const start = lifecycle.GetTickCount64();
+        const rows = try collect(arena.allocator(), std.testing.io, .{ .source = source, .max_rows = cap });
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expect(lifecycle.GetTickCount64() - start < 1500);
+    }
+}
+
+test "cancelling after EOF kills a child that has not exited" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const source: Source = .{ .command = .{ .argv = &.{ "python", "-c", "import os,time;os.close(1);time.sleep(2)" } } };
+    var session = Session.init(std.testing.io, .{ .source = source });
+    defer session.deinit();
+    try session.start();
+    session.thread.?.join();
+    session.thread = null;
+    try std.testing.expect(session.shared.status().eof);
+    const start = lifecycle.GetTickCount64();
+    session.complete(true);
+    try std.testing.expect(lifecycle.GetTickCount64() - start < 1000);
+}
+
+test "stdin cancellation retries when read enters after the first cancel" {
+    const FakeReader = struct {
+        shared: Shared = .{ .filter = null, .max_rows = 0 },
+        calls: usize = 0,
+        fn cancel(self: *@This()) void {
+            self.calls += 1;
+            // The first cancellation precedes read entry; the second reaches it.
+            if (self.calls == 2) self.shared.finish(false, null);
+        }
+    };
+    var reader: FakeReader = .{};
+    reader.shared.stop();
+    cancelReader(&reader.shared, &reader, FakeReader.cancel);
+    try std.testing.expect(reader.shared.status().done);
+    try std.testing.expectEqual(@as(usize, 2), reader.calls);
 }

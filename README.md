@@ -87,3 +87,42 @@ Home/End, and Ctrl-A/Ctrl-E move within the query. Backspace or Ctrl-H deletes
 one character; Ctrl-U clears the query and Ctrl-W deletes a word.
 
 glean follows fzf by Junegunn Choi; see NOTICE for attribution and its MIT license.
+
+
+### Preview command templates
+
+The harness `--preview` option runs an executable directly on both Windows
+and Linux. The template is split into arguments once, before receiving rows.
+Whitespace separates arguments; single or double quotes group text and are
+removed. Backslashes are literal, so Windows paths need no extra escaping.
+A whole argument equal to `{}` receives the complete row as one literal
+argument, including spaces, quotes, and shell metacharacters. Embedded `{}`
+placeholders and unclosed quotes are rejected. The executable must be fixed.
+For example, `--preview 'my-viewer -- {}'` passes each row to `my-viewer`.
+
+Shell builtins, pipelines, redirection, and variable expansion are not part
+of this grammar. Replace earlier shell-style preview examples with an
+executable and separate arguments. Explicitly invoking a shell or interpreter
+with a row in its code argument transfers responsibility for evaluating that
+row to the caller. The library's existing `shell_quote` mode remains a legacy,
+unsafe option for untrusted rows; the harness does not enable it.
+
+### Producer and preview shutdown
+
+Stopping a command feed kills and reaps its direct child even after stdout
+has closed. Natural EOF allows a short exit grace period before killing it.
+Command previews keep their timeout active through process reaping.
+
+These guarantees cover direct children. Producer and preview descendants must
+not keep inherited stdout handles open after their parent exits. Glean does
+not create Windows Job Objects or process groups, so such descendants can
+still hold a reader open. Race-free Job assignment needs child creation in a
+suspended state before assigning the job and resuming execution; assigning
+a job after ordinary spawn would leave an escape window.
+
+Source callbacks must return promptly when `Sink.push` returns false. Preview
+callbacks must return promptly when superseded or on shutdown; their context
+must arrange cancellation for blocking work because the callback API has no
+stop-token argument. Glean joins these callbacks. Windows stdin cancellation
+retries until the reader acknowledges completion. Blocking stdin cancellation
+on non-Windows systems remains unsupported.

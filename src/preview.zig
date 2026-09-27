@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const worker_allocator = std.heap.smp_allocator;
+const lifecycle = @import("lifecycle.zig");
 extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
 
 fn sleepMs(milliseconds: u32) void {
@@ -26,6 +27,9 @@ pub const PreviewText = struct {
 pub const Previewer = struct {
     ctx: *anyopaque,
     /// Runs on the preview thread. The result must be allocated in arena.
+    /// Must return promptly when superseded by a new row or on shutdown.
+    /// Glean joins the worker; the context must supply any cancellation signal
+    /// needed by blocking work, since this callback has no stop-token argument.
     func: *const fn (ctx: *anyopaque, arena: Allocator, row: []const u8) anyerror!PreviewText,
 };
 
@@ -323,8 +327,11 @@ fn directoryPreview(arena: Allocator, io: std.Io, opened: std.Io.Dir) !PreviewTe
 pub const Command = struct {
     io: std.Io,
     argv: []const []const u8,
+    /// Bounds the direct child's lifetime. Descendants must not retain stdout:
+    /// inherited writers can prevent the reader from reaching timeout cleanup.
     timeout_ms: u32 = 3000,
-    /// For a shell command string, quote replacements inside each argument.
+    /// Legacy shell-source substitution, unsafe for untrusted rows or arbitrary
+    /// quoting contexts. Prefer whole-argument substitution with this disabled.
     shell_quote: bool = false,
 };
 
@@ -367,22 +374,31 @@ fn replaceTokens(arena: Allocator, template: []const u8, row: []const u8) ![]con
 }
 
 const Watchdog = struct {
+    const State = enum(u8) { running, reaping_by_main, killed_by_watchdog };
     child: *std.process.Child,
     io: std.Io,
     timeout_ms: u32,
-    done: std.atomic.Value(bool) = .init(false),
-    timed_out: std.atomic.Value(bool) = .init(false),
+    state: std.atomic.Value(State) = .init(.running),
+    gate: Mutex = .{},
+
+    fn claim(self: *Watchdog, target: State, require_exit: bool) bool {
+        // The gate also protects probing the handle from concurrent closure.
+        self.gate.lock();
+        defer self.gate.unlock();
+        if (self.state.load(.acquire) != .running) return false;
+        if (require_exit and !lifecycle.exited(self.child)) return false;
+        return self.state.cmpxchgStrong(.running, target, .acq_rel, .acquire) == null;
+    }
 
     fn run(self: *Watchdog) void {
         var waited: u32 = 0;
         while (waited < self.timeout_ms) {
-            if (self.done.load(.acquire)) return;
+            if (self.state.load(.acquire) != .running) return;
             const interval = @min(10, self.timeout_ms - waited);
             sleepMs(interval);
             waited += interval;
         }
-        if (!self.done.load(.acquire)) {
-            self.timed_out.store(true, .release);
+        if (self.claim(.killed_by_watchdog, false)) {
             self.child.kill(self.io);
         }
     }
@@ -401,26 +417,24 @@ fn commandRun(ctx: *anyopaque, arena: Allocator, row: []const u8) !PreviewText {
             arg;
     }
     var child = try std.process.spawn(command.io, .{ .argv = argv, .stdout = .pipe, .stderr = .ignore });
-    defer if (child.stdout) |file| file.close(command.io);
+    const output = child.stdout.?;
+    // Keep the reader's handle alive while the watchdog reaps the child.
+    child.stdout = null;
+    defer output.close(command.io);
     var watchdog: Watchdog = .{ .child = &child, .io = command.io, .timeout_ms = command.timeout_ms };
     const thread = std.Thread.spawn(.{}, Watchdog.run, .{&watchdog}) catch |err| {
         child.kill(command.io);
         return err;
     };
-    var joined = false;
-    var completed = false;
     defer {
-        if (!joined) {
-            watchdog.done.store(true, .release);
-            thread.join();
-        }
-        if (!completed and !watchdog.timed_out.load(.acquire)) child.kill(command.io);
+        if (watchdog.claim(.reaping_by_main, false)) child.kill(command.io);
+        thread.join();
     }
     var out: std.ArrayList(u8) = .empty;
     var buffer: [8192]u8 = undefined;
     while (true) {
-        const size = child.stdout.?.readStreaming(command.io, &.{buffer[0..]}) catch |err| {
-            if (builtin.os.tag == .windows or err == error.EndOfStream) break;
+        const size = lifecycle.readSize(output.readStreaming(command.io, &.{buffer[0..]})) catch |err| {
+            if (watchdog.state.load(.acquire) == .killed_by_watchdog) break;
             return err;
         };
         if (size == 0) break;
@@ -429,16 +443,14 @@ fn commandRun(ctx: *anyopaque, arena: Allocator, row: []const u8) !PreviewText {
         }
         try out.appendSlice(arena, buffer[0..size]);
     }
-    watchdog.done.store(true, .release);
-    thread.join();
-    joined = true;
-    if (watchdog.timed_out.load(.acquire)) {
-        completed = true;
-        return .{ .text = "(preview timed out)" };
+    while (watchdog.state.load(.acquire) == .running) {
+        if (watchdog.claim(.reaping_by_main, true)) {
+            _ = try child.wait(command.io);
+            return .{ .text = try out.toOwnedSlice(arena) };
+        }
+        sleepMs(5);
     }
-    _ = try child.wait(command.io);
-    completed = true;
-    return .{ .text = try out.toOwnedSlice(arena) };
+    return .{ .text = "(preview timed out)" };
 }
 
 fn emptyPreview(_: *anyopaque, _: Allocator, _: []const u8) anyerror!PreviewText {
@@ -533,4 +545,29 @@ test "Windows command preview substitutes the row and times out" {
     var slow: Command = .{ .io = std.testing.io, .argv = &.{ "cmd.exe", "/d", "/c", "ping -n 4 127.0.0.1 >nul" }, .timeout_ms = 50 };
     const timed = try commandRun(&slow, arena, "unused");
     try std.testing.expectEqualStrings("(preview timed out)", timed.text);
+}
+
+test "preview timeout covers exit after stdout closes" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var command: Command = .{
+        .io = std.testing.io,
+        .argv = &.{ "python", "-c", "import os,time;os.close(1);time.sleep(2)" },
+        .timeout_ms = 300,
+    };
+    const start = lifecycle.GetTickCount64();
+    const result = try commandRun(&command, arena.allocator(), "unused");
+    try std.testing.expectEqualStrings("(preview timed out)", result.text);
+    try std.testing.expect(lifecycle.GetTickCount64() - start < 1500);
+}
+
+test "harness preview passes shell metacharacters as one literal argument" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var command: Command = .{ .io = std.testing.io, .argv = try @import("preview_template.zig").parse(arena.allocator(), "python -c \"import sys;sys.stdout.write(sys.argv[1])\" \"{}\"") };
+    const row = "a&echo R1_INJECTED";
+    const result = try commandRun(&command, arena.allocator(), row);
+    try std.testing.expectEqualStrings(row, result.text);
 }
