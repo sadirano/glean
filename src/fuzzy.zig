@@ -172,7 +172,7 @@ pub fn rank(arena: std.mem.Allocator, query: Query, rows: []const []const u8) ![
         return result;
     }
 
-    const worker_count = @min(std.Thread.getCpuCount() catch 1, @max(@as(usize, 1), rows.len / 20_000));
+    const worker_count = @min(std.Thread.getCpuCount() catch 1, @max(@as(usize, 1), rows.len / 2_000));
     if (worker_count == 1) {
         const scratch = try arena.create(score.Scratch);
         defer arena.destroy(scratch);
