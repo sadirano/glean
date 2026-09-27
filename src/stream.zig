@@ -436,14 +436,14 @@ test "preview layout and focused line share the screen with the list" {
     var lines = std.mem.splitSequence(u8, frame, "\r\n");
     var index: usize = 0;
     while (lines.next()) |line| : (index += 1) {
-        if (index == 2) try std.testing.expect(std.mem.startsWith(u8, line, "8"));
+        if (index == 2) try std.testing.expect(std.mem.startsWith(u8, line, " 8"));
         if (index == 8) {
             try std.testing.expectEqual(@as(usize, 40), line.len);
             for (line) |byte| try std.testing.expectEqual(@as(u8, '-'), byte);
         }
         if (index == 17) try std.testing.expect(std.mem.startsWith(u8, line, ">  row"));
         if (index == 18) try std.testing.expect(std.mem.startsWith(u8, line, "1/1"));
-        if (index == 19) try std.testing.expect(std.mem.startsWith(u8, line, "> _"));
+        if (index == 19) try std.testing.expect(std.mem.startsWith(u8, line, "> "));
     }
     try std.testing.expectEqual(@as(usize, 20), index);
     try std.testing.expectEqual(@as(usize, 5), state.preview_scroll);

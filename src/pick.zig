@@ -7,6 +7,12 @@ const tui = @import("tui.zig");
 const preview = @import("preview.zig");
 const theme_zig = @import("theme.zig");
 const ansi = @import("ansi.zig");
+const cells = @import("cells.zig");
+const decoded = cells.decoded;
+const appendRune = cells.appendRune;
+const columns = cells.columns;
+const displayWidth = cells.displayWidth;
+const indexedRgb = cells.indexedRgb;
 
 const Allocator = std.mem.Allocator;
 
@@ -29,6 +35,7 @@ pub const Options = struct {
     preview: ?Previewer = null,
     preview_percent: u8 = 40,
     preview_wrap: bool = false,
+    preview_header_lines: usize = 0,
     /// fzf's --ansi: rows may carry SGR colors, which are drawn but neither
     /// matched against nor returned.
     ansi: bool = false,
@@ -347,42 +354,6 @@ const unicode_glyphs: Glyphs = .{
 };
 const ascii_glyphs: Glyphs = .{ .pointer = ">", .marker = "*", .separator = "-", .scroll = "|", .spinner = &.{ "-", "\\", "|", "/" } };
 
-fn decoded(s: []const u8, index: usize) struct { cp: u21, len: usize } {
-    const len = std.unicode.utf8ByteSequenceLength(s[index]) catch return .{ .cp = '?', .len = 1 };
-    if (index + len > s.len) return .{ .cp = '?', .len = 1 };
-    const cp = std.unicode.utf8Decode(s[index .. index + len]) catch return .{ .cp = '?', .len = 1 };
-    return .{ .cp = cp, .len = len };
-}
-
-fn appendRune(out: *std.ArrayList(u8), arena: Allocator, cp: u21) !void {
-    var bytes: [4]u8 = undefined;
-    const length = try std.unicode.utf8Encode(cp, &bytes);
-    try out.appendSlice(arena, bytes[0..length]);
-}
-
-fn columns(cp: u21) usize {
-    if ((cp >= 0x300 and cp <= 0x36f) or (cp >= 0x1ab0 and cp <= 0x1aff) or
-        (cp >= 0x1dc0 and cp <= 0x1dff) or (cp >= 0x20d0 and cp <= 0x20ff) or
-        (cp >= 0xfe20 and cp <= 0xfe2f) or (cp >= 0x3099 and cp <= 0x309a)) return 0;
-    if ((cp >= 0x1100 and cp <= 0x115f) or (cp >= 0x2329 and cp <= 0x232a) or
-        (cp >= 0x2e80 and cp <= 0xa4cf) or (cp >= 0xac00 and cp <= 0xd7a3) or
-        (cp >= 0xf900 and cp <= 0xfaff) or (cp >= 0xfe10 and cp <= 0xfe19) or
-        (cp >= 0xfe30 and cp <= 0xfe6f) or (cp >= 0xff01 and cp <= 0xff60) or
-        (cp >= 0xffe0 and cp <= 0xffe6) or (cp >= 0x20000 and cp <= 0x3fffd)) return 2;
-    return 1;
-}
-
-fn displayWidth(s: []const u8) usize {
-    var width: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        const d = decoded(s, i);
-        width += if (d.cp == '\t') 1 else columns(d.cp);
-        i += d.len;
-    }
-    return width;
-}
-
 fn append(out: *std.ArrayList(u8), arena: Allocator, s: []const u8) !void {
     try out.appendSlice(arena, s);
 }
@@ -398,27 +369,6 @@ fn setColor(out: *std.ArrayList(u8), arena: Allocator, color: Color, background:
         },
     };
     try append(out, arena, s);
-}
-
-fn indexedRgb(index: u8) Rgb {
-    const basic = [_]Rgb{
-        .{ .r = 0, .g = 0, .b = 0 },       .{ .r = 128, .g = 0, .b = 0 },
-        .{ .r = 0, .g = 128, .b = 0 },     .{ .r = 128, .g = 128, .b = 0 },
-        .{ .r = 0, .g = 0, .b = 128 },     .{ .r = 128, .g = 0, .b = 128 },
-        .{ .r = 0, .g = 128, .b = 128 },   .{ .r = 192, .g = 192, .b = 192 },
-        .{ .r = 128, .g = 128, .b = 128 }, .{ .r = 255, .g = 0, .b = 0 },
-        .{ .r = 0, .g = 255, .b = 0 },     .{ .r = 255, .g = 255, .b = 0 },
-        .{ .r = 0, .g = 0, .b = 255 },     .{ .r = 255, .g = 0, .b = 255 },
-        .{ .r = 0, .g = 255, .b = 255 },   .{ .r = 255, .g = 255, .b = 255 },
-    };
-    if (index < 16) return basic[index];
-    if (index >= 232) {
-        const gray: u8 = @intCast(8 + (index - 232) * @as(u16, 10));
-        return .{ .r = gray, .g = gray, .b = gray };
-    }
-    const cube = index - 16;
-    const levels = [_]u8{ 0, 95, 135, 175, 215, 255 };
-    return .{ .r = levels[cube / 36], .g = levels[cube / 6 % 6], .b = levels[cube % 6] };
 }
 
 fn style(out: *std.ArrayList(u8), arena: Allocator, colors: bool, fg: Color, bg: Color) !void {
@@ -471,7 +421,7 @@ fn renderRow(out: *std.ArrayList(u8), state: *State, theme: Theme, arena: Alloca
         try append(out, arena, if (state.marked[hit.index]) glyphs.marker else " ");
     }
     if (width > 2) {
-        try style(out, arena, colors, theme.gutter, bg);
+        try style(out, arena, colors, fg, if (active) bg else theme.gutter);
         try append(out, arena, " ");
     }
     const gutter = @min(width, @as(usize, 3));
@@ -542,73 +492,113 @@ fn renderRow(out: *std.ArrayList(u8), state: *State, theme: Theme, arena: Alloca
     }
     try pad(out, arena, used, text_width);
     if (scroll_width != 0) {
-        try style(out, arena, colors, theme.gutter, bg);
+        try style(out, arena, colors, fg, if (active) bg else theme.gutter);
         try append(out, arena, if (thumb) glyphs.scroll else " ");
     }
 }
 
-fn renderPrompt(out: *std.ArrayList(u8), state: *const State, theme: Theme, arena: Allocator, width: usize, colors: bool) !void {
+fn renderPrompt(out: *std.ArrayList(u8), state: *const State, theme: Theme, arena: Allocator, width: usize, colors: bool) !usize {
     try style(out, arena, colors, theme.prompt, theme.bg);
     const prompt_used = try plainWidth(out, arena, state.opts.prompt, width);
     const available = width - prompt_used;
-    if (available == 0) return;
-    var display: std.ArrayList(u8) = .empty;
-    defer display.deinit(arena);
-    try append(&display, arena, state.query.items[0..state.query_cursor]);
-    try append(&display, arena, "_");
-    try append(&display, arena, state.query.items[state.query_cursor..]);
+    if (available == 0) return width -| 1;
     const caret_col = displayWidth(state.query.items[0..state.query_cursor]);
     const skip_cols = if (caret_col >= available) caret_col - available + 1 else 0;
     var skip_bytes: usize = 0;
     var skipped: usize = 0;
-    while (skip_bytes < display.items.len and skipped < skip_cols) {
-        const d = decoded(display.items, skip_bytes);
+    while (skip_bytes < state.query.items.len and skipped < skip_cols) {
+        const d = decoded(state.query.items, skip_bytes);
         skipped += columns(d.cp);
         skip_bytes += d.len;
     }
     try style(out, arena, colors, theme.query, theme.bg);
-    const used = try plainWidth(out, arena, display.items[skip_bytes..], available);
+    const used = try plainWidth(out, arena, state.query.items[skip_bytes..], available);
     try pad(out, arena, prompt_used + used, width);
+    return @min(width - 1, prompt_used + (caret_col -| skipped));
+}
+
+fn previewTextWidth(out: *std.ArrayList(u8), arena: Allocator, text: []const u8, limit: usize, colors: bool) !usize {
+    var i: usize = 0;
+    var used: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0x1b) {
+            var end = i + 1;
+            while (end < text.len and text[end] != 'm') : (end += 1) {}
+            end = @min(end + 1, text.len);
+            if (colors) try append(out, arena, text[i..end]);
+            i = end;
+            continue;
+        }
+        const d = decoded(text, i);
+        const count = columns(d.cp);
+        if (used + count > limit) break;
+        try append(out, arena, text[i .. i + d.len]);
+        used += count;
+        i += d.len;
+    }
+    return used;
 }
 
 pub fn render(state: *State, theme: Theme, width: usize, height: usize, colors: bool, unicode: bool, arena: Allocator) ![]const u8 {
     state.setHeight(height);
     const glyphs = if (unicode) unicode_glyphs else ascii_glyphs;
     var out: std.ArrayList(u8) = .empty;
-    if (colors) try append(&out, arena, "\x1b[H");
+    if (colors) try append(&out, arena, "\x1b[?25l\x1b[H");
     const pane_height = state.preview_height -| 1;
+    const preview_left = @min(width, @as(usize, 1));
+    const preview_right = @min(width - preview_left, @as(usize, 1));
+    const preview_width = width - preview_left - preview_right;
     const formatted = if (pane_height > 0 and state.preview_text != null)
-        try preview.format(arena, state.preview_text.?, width, state.opts.preview_wrap, colors)
+        try preview.format(arena, state.preview_text.?, preview_width, state.opts.preview_wrap, colors)
     else
         null;
     defer if (formatted) |content| {
         for (content.lines) |line| arena.free(line.text);
         arena.free(content.lines);
     };
+    var sticky: usize = 0;
     if (formatted) |content| {
+        while (sticky < content.lines.len and content.lines[sticky].source <= state.opts.preview_header_lines) : (sticky += 1) {}
+        sticky = @min(sticky, pane_height);
         if (state.preview_focus_pending) {
-            state.preview_scroll = if (content.focus_row) |row| row -| (pane_height / 3) else 0;
+            state.preview_scroll = if (content.focus_row) |row| (row -| sticky) -| ((pane_height - sticky) / 3) else 0;
             state.preview_focus_pending = false;
         }
-        state.preview_scroll = @min(state.preview_scroll, content.lines.len -| 1);
+        state.preview_scroll = @min(state.preview_scroll, content.lines.len -| (sticky + 1));
     }
     const header_count = @min(@min(state.opts.header_lines, state.rows.len), height -| (2 +| state.preview_height));
     const list_height = height -| (2 + header_count + state.preview_height);
     const list_start = state.preview_height;
     const overflow = state.hits.len > list_height and list_height > 0;
+    var cursor_col: usize = 0;
     for (0..height) |line| {
         if (line != 0) try append(&out, arena, "\r\n");
         if (line < pane_height) {
             if (formatted) |content| {
-                const position = state.preview_scroll + line;
+                const position = if (line < sticky) line else state.preview_scroll + line;
+                var indicator: []const u8 = "";
+                var indicator_buf: [48]u8 = undefined;
+                if (line == 0 and content.lines.len > pane_height) {
+                    const top = @min(sticky + state.preview_scroll, content.lines.len - 1);
+                    indicator = try std.fmt.bufPrint(&indicator_buf, "{d}/{d}", .{ content.lines[top].source, content.lines[content.lines.len - 1].source });
+                    if (indicator.len > width) indicator = "";
+                }
+                const limit = if (indicator.len > 0) width - indicator.len else width;
                 if (position < content.lines.len) {
                     const visual = content.lines[position];
                     const focused = state.preview_text.?.focus_line != null and visual.source == state.preview_text.?.focus_line.?;
                     try style(&out, arena, colors, if (focused) theme.hl else theme.fg, theme.bg);
-                    try append(&out, arena, visual.text);
-                    try pad(&out, arena, visual.width, width);
+                    try pad(&out, arena, 0, @min(preview_left, limit));
+                    const used = try previewTextWidth(&out, arena, visual.text, limit -| preview_left, colors);
+                    if (colors) try append(&out, arena, "\x1b[0m");
+                    try pad(&out, arena, @min(preview_left, limit) + used, limit);
                 } else {
-                    try pad(&out, arena, 0, width);
+                    try pad(&out, arena, 0, limit);
+                }
+                if (indicator.len > 0) {
+                    try style(&out, arena, colors, theme.info, theme.bg);
+                    if (colors) try append(&out, arena, "\x1b[7m");
+                    try append(&out, arena, indicator);
                 }
             } else {
                 try pad(&out, arena, 0, width);
@@ -659,11 +649,15 @@ pub fn render(state: *State, theme: Theme, width: usize, height: usize, colors: 
             try style(&out, arena, colors, theme.separator, theme.bg);
             for (used..width) |_| try append(&out, arena, glyphs.separator);
         } else if (line == height - 1) {
-            try renderPrompt(&out, state, theme, arena, width, colors);
+            cursor_col = try renderPrompt(&out, state, theme, arena, width, colors);
         } else {
             try pad(&out, arena, 0, width);
         }
         if (colors) try append(&out, arena, "\x1b[0m");
+    }
+    if (colors and width > 0 and height > 0) {
+        var cursor_buf: [48]u8 = undefined;
+        try append(&out, arena, try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};{d}H\x1b[?25h", .{ height, cursor_col + 1 }));
     }
     return out.toOwnedSlice(arena);
 }
@@ -799,7 +793,7 @@ test "render uses the bottom prompt, info, pointer, and display-width clipping" 
     var index: usize = 0;
     while (lines.next()) |line| : (index += 1) {
         if (index == 8) try std.testing.expect(std.mem.indexOf(u8, line, "1/1") != null);
-        if (index == 9) try std.testing.expect(std.mem.startsWith(u8, line, "> 0_"));
+        if (index == 9) try std.testing.expect(std.mem.startsWith(u8, line, "> 0"));
         if (std.mem.startsWith(u8, line, "\u{258C}  0123")) {
             found_row = true;
             try std.testing.expectEqual(@as(usize, 40), displayWidth(line));

@@ -133,3 +133,126 @@ test "tab marks and moves down the drawn list, and the info line counts marks" {
     defer a.free(frame);
     try std.testing.expect(std.mem.indexOf(u8, frame, "3/3 (2)") != null);
 }
+
+fn previewStub(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!pick.PreviewText {
+    return .{ .text = "" };
+}
+
+test "preview header stays fixed while the remaining lines follow focus and scroll" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var state = try pick.State.init(a, &.{"row"}, .{
+        .preview = .{ .ctx = &context, .func = previewStub },
+        .preview_percent = 50,
+        .preview_header_lines = 3,
+    });
+    defer state.deinit();
+    state.setPreview(.{ .text = "H1\nH2\nH3\n4\n5\n6\n7\n8\n9\n10", .focus_line = 9 });
+    const frame = try pick.render(&state, .{}, 12, 12, false, false, a);
+    defer a.free(frame);
+    try std.testing.expectEqual(@as(usize, 4), state.preview_scroll);
+    var lines = std.mem.splitSequence(u8, frame, "\r\n");
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, " H1"));
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, " H2"));
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, " H3"));
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, " 8"));
+    _ = try state.step(.shift_down);
+    const scrolled = try pick.render(&state, .{}, 12, 12, false, false, a);
+    defer a.free(scrolled);
+    lines = std.mem.splitSequence(u8, scrolled, "\r\n");
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, " H1"));
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, " H2"));
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, " H3"));
+    try std.testing.expect(std.mem.startsWith(u8, lines.next().?, " 9"));
+}
+
+test "preview scroll position overlays the first row in reverse info color" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var state = try pick.State.init(a, &.{"row"}, .{
+        .preview = .{ .ctx = &context, .func = previewStub },
+        .preview_percent = 50,
+        .preview_header_lines = 3,
+    });
+    defer state.deinit();
+    state.setPreview(.{ .text = "H1\nH2\nH3\n4\n5\n6\n7\n8\n9\n10" });
+    state.preview_scroll = 4;
+    state.preview_focus_pending = false;
+    const plain = try pick.render(&state, .{}, 12, 12, false, false, a);
+    defer a.free(plain);
+    var plain_lines = std.mem.splitSequence(u8, plain, "\r\n");
+    const first = plain_lines.next().?;
+    try std.testing.expectEqual(@as(usize, 12), first.len);
+    try std.testing.expect(std.mem.endsWith(u8, first, "8/10"));
+    var theme: pick.Theme = .{};
+    theme.info = .{ .rgb = .{ .r = 11, .g = 22, .b = 33 } };
+    const colored = try pick.render(&state, theme, 12, 12, true, false, a);
+    defer a.free(colored);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[38;2;11;22;33m\x1b[7m8/10") != null);
+    state.opts.preview_header_lines = 0;
+    state.opts.preview_wrap = true;
+    state.setPreview(.{ .text = "abcdefghijklmnopqrstu\nz" });
+    const wrapped = try pick.render(&state, .{}, 6, 8, false, false, a);
+    defer a.free(wrapped);
+    var wrapped_lines = std.mem.splitSequence(u8, wrapped, "\r\n");
+    try std.testing.expect(std.mem.endsWith(u8, wrapped_lines.next().?, "1/2"));
+}
+
+test "preview has one column of padding on each side" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var state = try pick.State.init(a, &.{"row"}, .{
+        .preview = .{ .ctx = &context, .func = previewStub },
+        .preview_percent = 50,
+    });
+    defer state.deinit();
+    state.setPreview(.{ .text = "abcdefghi" });
+    const frame = try pick.render(&state, .{}, 8, 12, false, false, a);
+    defer a.free(frame);
+    var frame_lines = std.mem.splitSequence(u8, frame, "\r\n");
+    try std.testing.expectEqualStrings(" abcdef ", frame_lines.next().?);
+    for (0..4) |width| {
+        const tiny = try pick.render(&state, .{}, width, 12, false, false, a);
+        defer a.free(tiny);
+        var lines = std.mem.splitSequence(u8, tiny, "\r\n");
+        while (lines.next()) |line| try std.testing.expectEqual(width, line.len);
+    }
+}
+
+test "inactive gutter and scrollbar cells use gutter as their background" {
+    const a = std.testing.allocator;
+    const rows = [_][]const u8{"row"} ** 10;
+    var state = try pick.State.init(a, &rows, .{});
+    defer state.deinit();
+    var theme: pick.Theme = .{};
+    theme.gutter = .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } };
+    theme.bg_plus = .{ .rgb = .{ .r = 4, .g = 5, .b = 6 } };
+    const frame = try pick.render(&state, theme, 12, 6, true, false, a);
+    defer a.free(frame);
+    var lines = std.mem.splitSequence(u8, frame, "\r\n");
+    const inactive = lines.next().?;
+    _ = lines.next();
+    _ = lines.next();
+    const current = lines.next().?;
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, inactive, "\x1b[48;2;1;2;3m"));
+    try std.testing.expect(std.mem.indexOf(u8, current, "\x1b[48;2;1;2;3m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, current, "\x1b[48;2;4;5;6m") != null);
+}
+
+test "query uses the terminal cursor only in colored frames" {
+    const a = std.testing.allocator;
+    var state = try pick.State.init(a, &.{"row"}, .{});
+    defer state.deinit();
+    _ = try state.step(.{ .character = 'a' });
+    _ = try state.step(.{ .character = 'b' });
+    _ = try state.step(.left);
+    const plain = try pick.render(&state, .{}, 12, 4, false, false, a);
+    defer a.free(plain);
+    try std.testing.expect(std.mem.indexOfScalar(u8, plain, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, plain, '_') == null);
+    try std.testing.expect(std.mem.endsWith(u8, plain, "> ab        "));
+    const colored = try pick.render(&state, .{}, 12, 4, true, false, a);
+    defer a.free(colored);
+    try std.testing.expect(std.mem.startsWith(u8, colored, "\x1b[?25l\x1b[H"));
+    try std.testing.expect(std.mem.endsWith(u8, colored, "\x1b[4;4H\x1b[?25h"));
+}

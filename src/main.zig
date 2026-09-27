@@ -4,7 +4,7 @@ const stream = @import("stream.zig");
 const pick = @import("pick.zig");
 const fuzzy = @import("fuzzy.zig");
 
-const usage = "usage: glean [--multi] [--ansi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--max-rows N] [--filter QUERY] [--preview COMMAND | --preview-text] [--preview-window up:N%[:wrap]] [FILE | -- COMMAND...]\n";
+const usage = "usage: glean [--multi] [--ansi] [--prompt TEXT] [--header-lines N] [--delimiter C] [--with-nth N..] [--max-rows N] [--filter QUERY] [--preview COMMAND | --preview-text] [--preview-window up:N%[:wrap][:~N]] [FILE | -- COMMAND...]\n";
 
 const FileRows = struct { rows: []const []const u8 };
 
@@ -119,13 +119,36 @@ fn run(init: std.process.Init, arena: std.mem.Allocator, args: []const []const u
                 };
                 const suffix = spec[percent_end + 1 ..];
                 const percent = std.fmt.parseInt(u8, spec[0..percent_end], 10) catch 101;
-                if (percent > 100 or (!std.mem.eql(u8, suffix, "") and !std.mem.eql(u8, suffix, ":wrap"))) {
+                var valid = percent <= 100;
+                var wrap = false;
+                var header_lines: usize = 0;
+                if (suffix.len > 0) {
+                    if (suffix[0] != ':') {
+                        valid = false;
+                    } else {
+                        var parts = std.mem.splitScalar(u8, suffix[1..], ':');
+                        while (parts.next()) |part| {
+                            if (std.mem.eql(u8, part, "wrap")) {
+                                wrap = true;
+                            } else if (std.mem.startsWith(u8, part, "~") and part.len > 1) {
+                                header_lines = std.fmt.parseInt(usize, part[1..], 10) catch blk: {
+                                    valid = false;
+                                    break :blk 0;
+                                };
+                            } else {
+                                valid = false;
+                            }
+                        }
+                    }
+                }
+                if (!valid) {
                     try err.print("glean: invalid preview window {s}\n", .{value});
                     try err.flush();
                     return 2;
                 }
                 opts.preview_percent = percent;
-                opts.preview_wrap = std.mem.eql(u8, suffix, ":wrap");
+                opts.preview_wrap = wrap;
+                opts.preview_header_lines = header_lines;
             } else if (std.mem.eql(u8, arg, "--max-rows")) {
                 max_rows = std.fmt.parseInt(usize, value, 10) catch {
                     try err.print("glean: invalid value for {s}: {s}\n", .{ arg, value });
