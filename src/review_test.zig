@@ -6,7 +6,7 @@ test "parallel rank releases worker bookkeeping" {
     var query_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer query_arena.deinit();
     const query = try fuzzy.parseQuery(query_arena.allocator(), "a", .smart);
-    const rows = [_][]const u8{"a"} ** 4000;
+    const rows = @as([4000][]const u8, @splat("a"));
     const hits = try fuzzy.rank(std.testing.allocator, query, &rows);
     defer std.testing.allocator.free(hits);
     try std.testing.expectEqual(rows.len, hits.len);
@@ -55,11 +55,11 @@ test "query edge cases and DP limits keep highlights within rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const long_query = "a" ** 257;
-    const long_row = "a" ** 600;
-    for ([_][]const u8{ "", "\\", "!", "^", "$", "^$", "|", "\xff", "a", "a" ** 32, long_query }) |text| {
+    const long_query = &@as([257]u8, @splat('a'));
+    const long_row = &@as([600]u8, @splat('a'));
+    for ([_][]const u8{ "", "\\", "!", "^", "$", "^$", "|", "\xff", "a", &@as([32]u8, @splat('a')), long_query }) |text| {
         const query = try fuzzy.parseQuery(a, text, .smart);
-        for ([_][]const u8{ "", "\\!^$", "\xff\xc3(", "caf\u{00e9}", "a" ** 300, long_row }) |row| {
+        for ([_][]const u8{ "", "\\!^$", "\xff\xc3(", "caf\u{00e9}", &@as([300]u8, @splat('a')), long_row }) |row| {
             var positions: std.ArrayList(usize) = .empty;
             const value = try fuzzy.matchRow(query, row, &positions, a);
             for (positions.items) |position| try std.testing.expect(position < row.len);
@@ -70,7 +70,7 @@ test "query edge cases and DP limits keep highlights within rows" {
 }
 
 test "growing the viewport clamps scroll to a full final page" {
-    const rows = [_][]const u8{"row"} ** 100;
+    const rows = @as([100][]const u8, @splat("row"));
     var state = try pick.State.init(std.testing.allocator, &rows, .{});
     defer state.deinit();
     state.setHeight(5);
@@ -221,7 +221,7 @@ test "preview has one column of padding on each side" {
 
 test "inactive gutter and scrollbar cells use gutter as their background" {
     const a = std.testing.allocator;
-    const rows = [_][]const u8{"row"} ** 10;
+    const rows = @as([10][]const u8, @splat("row"));
     var state = try pick.State.init(a, &rows, .{});
     defer state.deinit();
     var theme: pick.Theme = .{};

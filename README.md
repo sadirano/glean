@@ -1,6 +1,6 @@
 # glean
 
-glean is a Zig 0.16 fuzzy picker library with fzf-style queries, for programs
+glean is a Zig 0.17 fuzzy picker library with fzf-style queries, for programs
 that want a picker without calling an external one. It supports both a supplied
 list of rows and feeds that stream rows while the picker is open.
 
